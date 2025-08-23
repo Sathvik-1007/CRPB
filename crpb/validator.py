@@ -6,13 +6,12 @@ from .specs import FileSpec
 
 
 def basic_file_validation(fs: FileSpec) -> Tuple[bool, str]:
-    if not fs.functions:
-        return False, "FileSpec must declare at least one function"
-    for name, f in fs.functions.items():
-        if name not in fs.exports:
-            return False, f"Function {name} not exported"
-        if not f.signature.startswith("def "):
-            return False, f"Function {name} must start with 'def ' in signature"
+    # Allow files with zero functions (e.g., config, README, non-code assets)
+    # Ensure that any declared exports are actually defined in functions
+    if fs.exports:
+        for exp in fs.exports:
+            if exp not in fs.functions:
+                return False, f"Export {exp} not defined in functions"
     return True, "ok"
 
 
@@ -64,6 +63,7 @@ def import_safety_check(code: str, allowed: Set[str] | None = None) -> Tuple[boo
       included in CRPB_IMPORT_BASELINE.
     """
     baseline = {
+        "__future__",
         "typing",
         "math",
         "random",
@@ -163,6 +163,10 @@ def runtime_validate_examples(fs: FileSpec, assembled_path: str) -> Tuple[bool, 
     """
     results: List[dict] = []
     if not fs.functions:
+        return True, results
+    # If there are no examples for any function in this file, skip runtime import/execution.
+    total_examples = sum(len(f.examples) for f in fs.functions.values())
+    if total_examples == 0:
         return True, results
     mod_name = "crpb_runtime_" + str(abs(hash(assembled_path)))
     try:

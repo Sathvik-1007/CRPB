@@ -5,12 +5,11 @@ import os
 import typer
 from rich.console import Console
 from ..config import resolve_run_dir, make_paths
-from ..specs import Plan
-from ..planner import generate_plan
+from ..planner import generate_task_plan
 from ..utils.fs import atomic_write_json
 from ..utils.ui import sep
 
-app = typer.Typer(help="Plan a project and save idea/constraints under run/plan/")
+app = typer.Typer(help="Plan a hierarchical TaskPlan and save under run/plan/")
 console = Console()
 
 
@@ -21,14 +20,14 @@ def main(
     run_dir: str = typer.Option(None, "--run-dir", help="Base runs folder"),
     run: str = typer.Option("new", "--run", help="run_<ts> | latest | new | name"),
 ):
-    sep("PLAN START")
+    sep("PLAN TASKS START")
     base = Path(run_dir) if run_dir else None
     run_path = resolve_run_dir(base, run)
     paths = make_paths(run_path)
 
     # Fail fast if no LLM key
     if not os.environ.get("OPENAI_API_KEY"):
-        console.print("[red]LLM required for planning: set OPENAI_API_KEY[/red]")
+        console.print("[red]LLM required for task planning: set OPENAI_API_KEY[/red]")
         raise typer.Exit(code=2)
 
     try:
@@ -37,16 +36,10 @@ def main(
         console.print(f"[red]Invalid constraints JSON: {e}")
         raise typer.Exit(code=2)
 
-    # Generate a plan (LLM-backed). LLM is always required.
-    plan_model, file_specs = generate_plan(idea, constraints_obj, use_llm=True)
+    task_plan = generate_task_plan(idea, constraints_obj, use_llm=True)
     atomic_write_json(paths.plan / "idea.json", {"idea": idea})
     atomic_write_json(paths.plan / "constraints.json", constraints_obj)
-    atomic_write_json(paths.plan / "plan.json", plan_model.model_dump())
-    # Also write individual file specs for traceability
-    import hashlib
-    for fs in file_specs:
-        fid = hashlib.sha1(fs.path.encode("utf-8")).hexdigest()[:10]
-        atomic_write_json(paths.specs / f"file_{fid}.json", fs.model_dump())
+    atomic_write_json(paths.plan / "task_plan.json", task_plan.model_dump())
     atomic_write_json(paths.outputs / "manifest.json", {"run": str(run_path)})
-    sep("PLAN DONE")
-    console.print(f"[green]Planned[/green] run at: {run_path}. Files: {[fs.path for fs in file_specs]}")
+    sep("PLAN TASKS DONE")
+    console.print(f"[green]Planned TaskPlan[/green] at: {run_path}. Tasks: {len(task_plan.tasks)}")

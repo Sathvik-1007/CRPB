@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing import List, Tuple
-from .specs import Plan, ModuleSpec, FileSpec, FunctionSpec, FunctionExample
+from pathlib import Path as _Path
+from .specs import Plan, ModuleSpec, FileSpec, FunctionSpec, FunctionExample, TaskPlan, TaskSpec
 
 
 def _fallback_plan(idea: str, constraints: dict) -> Tuple[Plan, List[FileSpec]]:
@@ -12,9 +13,17 @@ def _fallback_plan(idea: str, constraints: dict) -> Tuple[Plan, List[FileSpec]]:
     Absolutely no domain-specific assumptions; defaults remain generic.
     """
 
-    def build_function_spec(fd: dict) -> FunctionSpec:
+    def build_function_spec(fd: dict, *, language: str | None = None) -> FunctionSpec:
         name = fd.get("name") or fd.get("function") or "run"
-        signature = fd.get("signature") or f"def {name}() -> None"
+        # Default signature is language-aware; for non-Python code or assets, it can be empty
+        if "signature" in fd and isinstance(fd.get("signature"), str):
+            signature = fd.get("signature")
+        else:
+            if language == "python":
+                signature = f"def {name}() -> None"
+            else:
+                # Leave unspecified for non-Python (frontend/assets may have 0 functions)
+                signature = ""
         returns = fd.get("returns", "None")
         description = fd.get("description", "")
         deps = fd.get("deps", [])
@@ -34,7 +43,26 @@ def _fallback_plan(idea: str, constraints: dict) -> Tuple[Plan, List[FileSpec]]:
         )
 
     def build_file_spec(fd: dict) -> FileSpec:
-        language = fd.get("language", "python")
+        # Infer language from path extension if not provided; avoid defaulting to python
+        language = fd.get("language")
+        raw_path = fd.get("path") or fd.get("default_path")
+        if not language and raw_path:
+            ext = _Path(raw_path).suffix.lower().lstrip(".")
+            language = {
+                "py": "python",
+                "ts": "typescript",
+                "tsx": "typescript",
+                "js": "javascript",
+                "jsx": "javascript",
+                "go": "go",
+                "html": "html",
+                "css": "css",
+                "json": "json",
+                "md": "markdown",
+                "toml": "toml",
+                "yaml": "yaml",
+                "yml": "yaml",
+            }.get(ext)
         # basic extension mapping without implying domain
         ext_map = {"python": "py", "typescript": "ts", "go": "go", "html": "html", "css": "css", "json": "json"}
         default_name = fd.get("default_filename", "main")
@@ -50,14 +78,14 @@ def _fallback_plan(idea: str, constraints: dict) -> Tuple[Plan, List[FileSpec]]:
                 # ensure name present
                 meta = dict(meta or {})
                 meta.setdefault("name", fname)
-                functions[fname] = build_function_spec(meta)
+                functions[fname] = build_function_spec(meta, language=language)
         elif isinstance(funcs_in, list):
             for item in funcs_in:
-                fs = build_function_spec(item or {})
+                fs = build_function_spec(item or {}, language=language)
                 functions[fs.name] = fs
         else:
             # minimal default single function based on entrypoint
-            functions[entrypoint] = build_function_spec({"name": entrypoint})
+            functions[entrypoint] = build_function_spec({"name": entrypoint}, language=language)
         exports = fd.get("exports") or [n for n in functions.keys()]
         if entrypoint and entrypoint not in exports:
             exports = [entrypoint] + [e for e in exports if e != entrypoint]
@@ -96,7 +124,7 @@ def _fallback_plan(idea: str, constraints: dict) -> Tuple[Plan, List[FileSpec]]:
         return Plan(idea=idea, constraints=constraints, modules=modules), files
 
     # 3) Minimal deterministic default using provided defaults (no domain assumptions)
-    language = constraints.get("default_language", "python") if isinstance(constraints, dict) else "python"
+    language = constraints.get("default_language") if isinstance(constraints, dict) else None
     entrypoint = (constraints.get("entrypoint") or constraints.get("default_entrypoint") or "run") if isinstance(constraints, dict) else "run"
     imports = (constraints.get("imports") or []) if isinstance(constraints, dict) else []
     path = None
@@ -112,7 +140,7 @@ def _fallback_plan(idea: str, constraints: dict) -> Tuple[Plan, List[FileSpec]]:
     functions = {
         entrypoint: FunctionSpec(
             name=entrypoint,
-            signature=f"def {entrypoint}() -> None" if language == "python" else f"function {entrypoint}()",
+            signature=f"def {entrypoint}() -> None" if language == "python" else "",
             returns="None",
             description="",
             examples=[],
@@ -125,44 +153,16 @@ def _fallback_plan(idea: str, constraints: dict) -> Tuple[Plan, List[FileSpec]]:
     return Plan(idea=idea, constraints=constraints, modules=modules), files
 
 
-def generate_plan(idea: str, constraints: dict, use_llm: bool = True, require_llm: bool = False) -> Tuple[Plan, List[FileSpec]]:
+def generate_plan(idea: str, constraints: dict, use_llm: bool = True) -> Tuple[Plan, List[FileSpec]]:
     """
-    Use LLM (if available) to propose a multi-file plan (modules->files->functions).
-    Falls back to a deterministic python plan if LLM is unavailable or fails.
+    Use the LLM to propose a multi-file plan (modules->files->functions).
+    LLM is required; if unavailable or fails, this function raises an error.
     """
     if use_llm:
         try:
-            from .agents.llm import LLM
-            import json
-            llm = LLM()
-            system = (
-                "You are the Root Planning Agent in a recursive, parent-mediated build system (CRPB).\n"
-                "Strictly output ONLY valid minified JSON matching this schema: {\n"
-                "  modules: [\n"
-                "    { name: string, purpose: string, priority: 'high'|'medium'|'low', deps: string[], files: [\n"
-                "      { path: string, language: string, exports: string[], imports?: string[], entrypoint?: string,\n"
-                "        functions: { [name: string]: { signature: string, returns: string, description: string, deps: string[], examples?: {in: object, out: object}[], tests?: string[] } }\n"
-                "      }\n"
-                "    ] }\n"
-                "  ]\n"
-                "}.\n"
-                "Hard rules:\n"
-                "- No code in any field. Only signatures and metadata.\n"
-                "- Use snake_case for python function names.\n"
-                "- Declare explicit deps only by function names within the same module/file unless absolutely necessary; cross-file deps must be minimal and parent will mediate via stubs/futures.\n"
-                "- Prefer many small cohesive files over monoliths; keep exports minimal and clear.\n"
-                "- Only include imports if concretely required; do not guess domain libraries.\n"
-                "- Do not fabricate examples or tests; include them only if constraints provide them or they are trivial.\n"
-                "- If a file has a natural entrypoint, set entrypoint to that exported function's name.\n"
-                "- Keep the total number of functions reasonable; avoid deep dependency chains in a single step.\n"
-                "- Do not include any commentary text outside JSON."
-            )
-            user = (
-                "Plan a project for the following idea and constraints. Ensure valid JSON and include language per file.\n"
-                f"idea: {idea}\nconstraints: {json.dumps(constraints)}"
-            )
-            content = llm.complete(system=system, messages=[{"role": "user", "content": user}], temperature=0.0)
-            obj = json.loads(content)
+            from .agents.dspy_engine import DspyEngine
+            engine = DspyEngine()
+            obj = engine.plan(idea, constraints)
             modules: List[ModuleSpec] = []
             files_all: List[FileSpec] = []
             for m in obj.get("modules", []):
@@ -170,10 +170,36 @@ def generate_plan(idea: str, constraints: dict, use_llm: bool = True, require_ll
                 for f in m.get("files", []):
                     funcs = {}
                     ffuncs = f.get("functions", {})
+                    # Determine language early to select sane defaults (infer from path if missing)
+                    _lang = f.get("language")
+                    if not _lang:
+                        try:
+                            ext = _Path(f.get("path", "")).suffix.lower().lstrip(".")
+                            _lang = {
+                                "py": "python",
+                                "ts": "typescript",
+                                "tsx": "typescript",
+                                "js": "javascript",
+                                "jsx": "javascript",
+                                "go": "go",
+                                "html": "html",
+                                "css": "css",
+                                "json": "json",
+                                "md": "markdown",
+                                "toml": "toml",
+                                "yaml": "yaml",
+                                "yml": "yaml",
+                            }.get(ext)
+                        except Exception:
+                            _lang = None
                     for fname, fmeta in ffuncs.items():
+                        # Default signature: Python gets a concrete def; others may be empty/unspecified
+                        _sig = fmeta.get("signature")
+                        if _sig is None:
+                            _sig = f"def {fname}() -> None" if _lang == "python" else ""
                         funcs[fname] = FunctionSpec(
                             name=fname,
-                            signature=fmeta.get("signature", f"def {fname}() -> None"),
+                            signature=_sig,
                             returns=fmeta.get("returns", "None"),
                             description=fmeta.get("description", ""),
                             examples=[FunctionExample(inp=e.get("in", {}), out=e.get("out", {})) for e in fmeta.get("examples", [])],
@@ -188,7 +214,7 @@ def generate_plan(idea: str, constraints: dict, use_llm: bool = True, require_ll
                         entry = "run"
                     fs = FileSpec(
                         path=f.get("path"),
-                        language=f.get("language", "python"),
+                        language=_lang,
                         exports=f.get("exports", list(funcs.keys())),
                         functions=funcs,
                         imports=imports,
@@ -209,8 +235,45 @@ def generate_plan(idea: str, constraints: dict, use_llm: bool = True, require_ll
                 raise ValueError("empty-plan")
             return plan, files_all
         except Exception as e:
-            if require_llm:
-                raise
-            # else: fall back deterministically
-            pass
-    return _fallback_plan(idea, constraints)
+            # Always require DSPy; provide a clear, actionable message.
+            raise RuntimeError(
+                f"DSPy planning failed: {e}. Ensure OPENAI_API_KEY and dspy-ai are installed."
+            )
+    # If use_llm is False or anything else, we still enforce LLM usage to keep behavior strict.
+    raise RuntimeError("LLM planning disabled by configuration, but fallbacks are removed. Enable LLM.")
+
+
+def generate_task_plan(idea: str, constraints: dict, use_llm: bool = True) -> TaskPlan:
+    """
+    Produce a generic hierarchical TaskPlan using the LLM. No code, only structure and metadata.
+    LLM is required; if unavailable or fails, this function raises an error.
+    """
+    if use_llm:
+        try:
+            from .agents.dspy_engine import DspyEngine
+            engine = DspyEngine()
+            obj = engine.task_plan(idea, constraints)
+            def build_task(t: dict) -> TaskSpec:
+                children = [build_task(c) for c in t.get("children", [])]
+                return TaskSpec(
+                    id=t.get("id"),
+                    kind=t.get("kind", "composite"),
+                    title=t.get("title", ""),
+                    description=t.get("description", ""),
+                    priority=t.get("priority", "medium"),
+                    deps=t.get("deps", []),
+                    inputs=t.get("inputs", {}),
+                    outputs=t.get("outputs", {}),
+                    children=children,
+                )
+            tasks = [build_task(x) for x in obj.get("tasks", [])]
+            if not tasks:
+                raise ValueError("empty-task-plan")
+            return TaskPlan(idea=idea, constraints=constraints, tasks=tasks)
+        except Exception as e:
+            # Always require DSPy; provide a clear, actionable message.
+            raise RuntimeError(
+                f"DSPy task planning failed: {e}. Ensure OPENAI_API_KEY and dspy-ai are installed."
+            )
+    # If use_llm is False or anything else, we still enforce LLM usage to keep behavior strict.
+    raise RuntimeError("LLM task planning disabled by configuration, but fallbacks are removed. Enable LLM.")

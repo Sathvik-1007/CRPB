@@ -15,6 +15,7 @@ console = Console()
 def main(
     run_dir: str = typer.Option(None, "--run-dir", help="Base runs folder"),
     run: str = typer.Option("latest", "--run", help="run_<ts> | latest | name"),
+    raw: bool = typer.Option(False, "--raw/--compact", help="Print raw JSON events instead of a compact summary"),
 ):
     sep("WATCH")
     base = Path(run_dir) if run_dir else None
@@ -31,7 +32,17 @@ def main(
                 for line in f:
                     try:
                         rec = json.loads(line)
-                        console.print(rec)
+                        if raw:
+                            console.print(rec)
+                        else:
+                            et = rec.get("type")
+                            at = rec.get("at")
+                            payload = rec.get("payload", {}) or {}
+                            nid = payload.get("node_id") or payload.get("child") or payload.get("parent")
+                            tid = payload.get("task_id")
+                            parent = payload.get("parent_id")
+                            # Minimal compact rendering
+                            console.print(f"[{at}] {et} nid={nid} tid={tid} parent={parent}")
                     except Exception:
                         pass
                 pos = f.tell()

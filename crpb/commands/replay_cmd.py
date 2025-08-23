@@ -43,6 +43,7 @@ def main(
         "first_event_at": None,
         "last_event_at": None,
         "functions": {},  # key path::name -> {last_event, first_at, last_at, future_wait, future_ready, timeline}
+        "tasks": {},      # task_id -> {kind, last_event, first_at, last_at, assigned, split, done, failed, timeline}
     }
 
     for evt in _iter_events(events_path):
@@ -56,7 +57,7 @@ def main(
         node_id = payload.get("node_id")
         if node_id:
             status["nodes"][node_id] = et
-        # per-function rollup
+        # per-function rollup (classic build flow)
         fpath = payload.get("path")
         fname = payload.get("name")
         if fpath and fname:
@@ -75,6 +76,42 @@ def main(
             elif et == "FUTURE_READY":
                 rec["future_ready"] += 1
 
+        # per-task rollup (TaskPlan recursive flow)
+        norm = et
+        if isinstance(et, str) and et.startswith("CHILD_"):
+            norm = "TASK_" + et[len("CHILD_"):]
+        if norm in ("TASK_ASSIGNED", "TASK_SPLIT", "TASK_DONE", "TASK_FAILED"):
+            tid = payload.get("task_id")
+            if tid:
+                trec = status["tasks"].setdefault(
+                    tid,
+                    {
+                        "kind": payload.get("kind"),
+                        "last_event": None,
+                        "first_at": None,
+                        "last_at": None,
+                        "assigned": 0,
+                        "split": 0,
+                        "done": 0,
+                        "failed": 0,
+                        "timeline": [],
+                    },
+                )
+                trec["kind"] = trec.get("kind") or payload.get("kind")
+                trec["last_event"] = norm
+                if at is not None:
+                    trec["first_at"] = at if trec["first_at"] is None else min(trec["first_at"], at)
+                    trec["last_at"] = at if trec["last_at"] is None else max(trec["last_at"], at)
+                    trec["timeline"].append({"at": at, "type": norm})
+                if norm == "TASK_ASSIGNED":
+                    trec["assigned"] += 1
+                elif norm == "TASK_SPLIT":
+                    trec["split"] += 1
+                elif norm == "TASK_DONE":
+                    trec["done"] += 1
+                elif norm == "TASK_FAILED":
+                    trec["failed"] += 1
+
     table = Table(title="Replay Summary")
     table.add_column("Metric")
     table.add_column("Value")
@@ -91,6 +128,28 @@ def main(
         for nid, last in status["nodes"].items():
             t2.add_row(nid, last)
         console.print(t2)
+
+    if status["tasks"]:
+        t_tasks = Table(title="Tasks (TaskPlan rollup)")
+        t_tasks.add_column("Task ID")
+        t_tasks.add_column("Kind")
+        t_tasks.add_column("Last Event")
+        t_tasks.add_column("ASSIGNED")
+        t_tasks.add_column("SPLIT")
+        t_tasks.add_column("DONE")
+        t_tasks.add_column("FAILED")
+        # show up to 100 tasks
+        for tid, trec in list(status["tasks"].items())[:100]:
+            t_tasks.add_row(
+                tid,
+                str(trec.get("kind")),
+                str(trec.get("last_event")),
+                str(trec.get("assigned")),
+                str(trec.get("split")),
+                str(trec.get("done")),
+                str(trec.get("failed")),
+            )
+        console.print(t_tasks)
 
     if status["functions"]:
         t3 = Table(title="Functions (timeline + futures)")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 from pathlib import Path
+import os
 from typing import Dict
 from .utils.fs import atomic_write_json, ensure_parent
 
@@ -11,6 +12,11 @@ def assemble_python_file(file_spec, impls: Dict[str, str]) -> str:
     - Optional __main__ entrypoint calling file_spec.entrypoint
     """
     parts: list[str] = []
+    # Configurable annotations behavior to avoid hardcoding per project
+    # CRPB_PY_ANNOTATIONS: 'deferred' | 'eager' | 'auto' (default)
+    ann_mode = os.getenv("CRPB_PY_ANNOTATIONS", "auto").lower()
+    if ann_mode in ("deferred", "auto"):
+        parts.append("from __future__ import annotations\n\n")
     # Header imports
     imports = getattr(file_spec, "imports", []) or []
     if imports:

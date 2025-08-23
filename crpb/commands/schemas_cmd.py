@@ -4,7 +4,7 @@ import json
 import typer
 from rich.console import Console
 from ..config import resolve_run_dir, make_paths
-from ..specs import FunctionExample, FunctionSpec, FileSpec, ModuleSpec, Plan
+from ..specs import FunctionExample, FunctionSpec, FileSpec, ModuleSpec, Plan, TaskSpec, TaskPlan
 from ..utils.ui import sep
 
 app = typer.Typer(help="Generate JSON Schemas for core specs into outputs/schemas/")
@@ -30,6 +30,8 @@ def main(
         "FileSpec": FileSpec,
         "ModuleSpec": ModuleSpec,
         "Plan": Plan,
+        "TaskSpec": TaskSpec,
+        "TaskPlan": TaskPlan,
     }
 
     for name, model in models.items():
