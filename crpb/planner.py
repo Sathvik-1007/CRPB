@@ -1,247 +1,13 @@
 from __future__ import annotations
-from typing import List, Tuple
-from pathlib import Path as _Path
-from .specs import Plan, ModuleSpec, FileSpec, FunctionSpec, FunctionExample, TaskPlan, TaskSpec
+from typing import List, Tuple, Dict, Any, Set, Optional
+import os
+import json
+import hashlib
+import re
+import logging
+from .specs import TaskPlan, TaskSpec
 
-
-def _fallback_plan(idea: str, constraints: dict) -> Tuple[Plan, List[FileSpec]]:
-    """
-    Deterministic, domain-agnostic fallback that is constraint-driven.
-    - If constraints contains full Plan-like modules/files/functions, honor them.
-    - Else if constraints contains a simplified `files` array, wrap in a single module.
-    - Else produce a minimal single-file spec using constraint defaults.
-    Absolutely no domain-specific assumptions; defaults remain generic.
-    """
-
-    def build_function_spec(fd: dict, *, language: str | None = None) -> FunctionSpec:
-        name = fd.get("name") or fd.get("function") or "run"
-        # Default signature is language-aware; for non-Python code or assets, it can be empty
-        if "signature" in fd and isinstance(fd.get("signature"), str):
-            signature = fd.get("signature")
-        else:
-            if language == "python":
-                signature = f"def {name}() -> None"
-            else:
-                # Leave unspecified for non-Python (frontend/assets may have 0 functions)
-                signature = ""
-        returns = fd.get("returns", "None")
-        description = fd.get("description", "")
-        deps = fd.get("deps", [])
-        examples = [
-            FunctionExample(inp=e.get("in", {}), out=e.get("out", {}))
-            for e in fd.get("examples", [])
-        ]
-        tests = fd.get("tests", [])
-        return FunctionSpec(
-            name=name,
-            signature=signature,
-            returns=returns,
-            description=description,
-            examples=examples,
-            tests=tests,
-            deps=deps,
-        )
-
-    def build_file_spec(fd: dict) -> FileSpec:
-        # Infer language from path extension if not provided; avoid defaulting to python
-        language = fd.get("language")
-        raw_path = fd.get("path") or fd.get("default_path")
-        if not language and raw_path:
-            ext = _Path(raw_path).suffix.lower().lstrip(".")
-            language = {
-                "py": "python",
-                "ts": "typescript",
-                "tsx": "typescript",
-                "js": "javascript",
-                "jsx": "javascript",
-                "go": "go",
-                "html": "html",
-                "css": "css",
-                "json": "json",
-                "md": "markdown",
-                "toml": "toml",
-                "yaml": "yaml",
-                "yml": "yaml",
-            }.get(ext)
-        # basic extension mapping without implying domain
-        ext_map = {"python": "py", "typescript": "ts", "go": "go", "html": "html", "css": "css", "json": "json"}
-        default_name = fd.get("default_filename", "main")
-        default_path = fd.get("default_path") or f"src/{default_name}.{ext_map.get(language, 'txt')}"
-        path = fd.get("path", default_path)
-        entrypoint = fd.get("entrypoint") or fd.get("default_entrypoint") or "run"
-        imports = fd.get("imports", [])
-        # functions can be dict{name->spec} or list of specs
-        funcs_in = fd.get("functions", {})
-        functions: dict[str, FunctionSpec] = {}
-        if isinstance(funcs_in, dict):
-            for fname, meta in funcs_in.items():
-                # ensure name present
-                meta = dict(meta or {})
-                meta.setdefault("name", fname)
-                functions[fname] = build_function_spec(meta, language=language)
-        elif isinstance(funcs_in, list):
-            for item in funcs_in:
-                fs = build_function_spec(item or {}, language=language)
-                functions[fs.name] = fs
-        else:
-            # minimal default single function based on entrypoint
-            functions[entrypoint] = build_function_spec({"name": entrypoint}, language=language)
-        exports = fd.get("exports") or [n for n in functions.keys()]
-        if entrypoint and entrypoint not in exports:
-            exports = [entrypoint] + [e for e in exports if e != entrypoint]
-        return FileSpec(
-            path=path,
-            language=language,
-            functions=functions,
-            exports=exports,
-            imports=imports,
-            entrypoint=entrypoint,
-        )
-
-    # 1) Full plan-like constraints with modules
-    if isinstance(constraints, dict) and constraints.get("modules"):
-        modules: List[ModuleSpec] = []
-        files_all: List[FileSpec] = []
-        for m in constraints.get("modules", []):
-            file_specs: List[FileSpec] = []
-            for f in m.get("files", []):
-                fs = build_file_spec(f)
-                file_specs.append(fs)
-                files_all.append(fs)
-            modules.append(ModuleSpec(
-                name=m.get("name", "app"),
-                purpose=m.get("purpose", ""),
-                priority=m.get("priority", "medium"),
-                deps=m.get("deps", []),
-                files=file_specs,
-            ))
-        return Plan(idea=idea, constraints=constraints, modules=modules), files_all
-
-    # 2) Simplified constraints with a `files` array
-    if isinstance(constraints, dict) and constraints.get("files"):
-        files: List[FileSpec] = [build_file_spec(f) for f in constraints.get("files", [])]
-        modules = [ModuleSpec(name=constraints.get("module_name", "app"), files=files)]
-        return Plan(idea=idea, constraints=constraints, modules=modules), files
-
-    # 3) Minimal deterministic default using provided defaults (no domain assumptions)
-    language = constraints.get("default_language") if isinstance(constraints, dict) else None
-    entrypoint = (constraints.get("entrypoint") or constraints.get("default_entrypoint") or "run") if isinstance(constraints, dict) else "run"
-    imports = (constraints.get("imports") or []) if isinstance(constraints, dict) else []
-    path = None
-    if isinstance(constraints, dict):
-        # reuse build_file_spec defaults by constructing a small dict
-        path = build_file_spec({
-            "language": language,
-            "default_filename": constraints.get("default_filename", "main"),
-            "default_path": constraints.get("default_path"),
-        }).path
-    else:
-        path = "src/main.py"
-    functions = {
-        entrypoint: FunctionSpec(
-            name=entrypoint,
-            signature=f"def {entrypoint}() -> None" if language == "python" else "",
-            returns="None",
-            description="",
-            examples=[],
-            tests=[],
-            deps=[],
-        )
-    }
-    files = [FileSpec(path=path, language=language, exports=[entrypoint], imports=imports, entrypoint=entrypoint, functions=functions)]
-    modules = [ModuleSpec(name=constraints.get("module_name", "app") if isinstance(constraints, dict) else "app", files=files)]
-    return Plan(idea=idea, constraints=constraints, modules=modules), files
-
-
-def generate_plan(idea: str, constraints: dict, use_llm: bool = True) -> Tuple[Plan, List[FileSpec]]:
-    """
-    Use the LLM to propose a multi-file plan (modules->files->functions).
-    LLM is required; if unavailable or fails, this function raises an error.
-    """
-    if use_llm:
-        try:
-            from .agents.dspy_engine import DspyEngine
-            engine = DspyEngine()
-            obj = engine.plan(idea, constraints)
-            modules: List[ModuleSpec] = []
-            files_all: List[FileSpec] = []
-            for m in obj.get("modules", []):
-                file_specs: List[FileSpec] = []
-                for f in m.get("files", []):
-                    funcs = {}
-                    ffuncs = f.get("functions", {})
-                    # Determine language early to select sane defaults (infer from path if missing)
-                    _lang = f.get("language")
-                    if not _lang:
-                        try:
-                            ext = _Path(f.get("path", "")).suffix.lower().lstrip(".")
-                            _lang = {
-                                "py": "python",
-                                "ts": "typescript",
-                                "tsx": "typescript",
-                                "js": "javascript",
-                                "jsx": "javascript",
-                                "go": "go",
-                                "html": "html",
-                                "css": "css",
-                                "json": "json",
-                                "md": "markdown",
-                                "toml": "toml",
-                                "yaml": "yaml",
-                                "yml": "yaml",
-                            }.get(ext)
-                        except Exception:
-                            _lang = None
-                    for fname, fmeta in ffuncs.items():
-                        # Default signature: Python gets a concrete def; others may be empty/unspecified
-                        _sig = fmeta.get("signature")
-                        if _sig is None:
-                            _sig = f"def {fname}() -> None" if _lang == "python" else ""
-                        funcs[fname] = FunctionSpec(
-                            name=fname,
-                            signature=_sig,
-                            returns=fmeta.get("returns", "None"),
-                            description=fmeta.get("description", ""),
-                            examples=[FunctionExample(inp=e.get("in", {}), out=e.get("out", {})) for e in fmeta.get("examples", [])],
-                            tests=fmeta.get("tests", []),
-                            deps=fmeta.get("deps", []),
-                        )
-                    # Integrity hints: imports/entrypoint (optional)
-                    imports = f.get("imports", [])
-                    entry = f.get("entrypoint")
-                    # Heuristic only for entrypoint if present in functions
-                    if not entry and ("run" in funcs):
-                        entry = "run"
-                    fs = FileSpec(
-                        path=f.get("path"),
-                        language=_lang,
-                        exports=f.get("exports", list(funcs.keys())),
-                        functions=funcs,
-                        imports=imports,
-                        entrypoint=entry,
-                    )
-                    file_specs.append(fs)
-                    files_all.append(fs)
-                modules.append(ModuleSpec(
-                    name=m.get("name", "app"),
-                    purpose=m.get("purpose", ""),
-                    priority=m.get("priority", "medium"),
-                    deps=m.get("deps", []),
-                    files=file_specs,
-                ))
-            plan = Plan(idea=idea, constraints=constraints, modules=modules)
-            # validate minimal
-            if not files_all:
-                raise ValueError("empty-plan")
-            return plan, files_all
-        except Exception as e:
-            # Always require DSPy; provide a clear, actionable message.
-            raise RuntimeError(
-                f"DSPy planning failed: {e}. Ensure OPENAI_API_KEY and dspy-ai are installed."
-            )
-    # If use_llm is False or anything else, we still enforce LLM usage to keep behavior strict.
-    raise RuntimeError("LLM planning disabled by configuration, but fallbacks are removed. Enable LLM.")
-
+logger = logging.getLogger(__name__)
 
 def generate_task_plan(idea: str, constraints: dict, use_llm: bool = True) -> TaskPlan:
     """
@@ -252,28 +18,262 @@ def generate_task_plan(idea: str, constraints: dict, use_llm: bool = True) -> Ta
         try:
             from .agents.dspy_engine import DspyEngine
             engine = DspyEngine()
-            obj = engine.task_plan(idea, constraints)
+            # Initial proposal
+            obj: Dict[str, Any] = engine.task_plan(idea, constraints)
+
+            # Helpers
+            def _normalize_task_dict(t: Dict[str, Any]) -> Dict[str, Any]:
+                d = dict(t or {})
+                d.setdefault("kind", d.get("type") or "composite")
+                d.setdefault("title", "")
+                d.setdefault("description", "")
+                if not isinstance(d.get("deps"), list):
+                    d["deps"] = []
+                if not isinstance(d.get("inputs"), dict):
+                    d["inputs"] = {}
+                if not isinstance(d.get("outputs"), dict):
+                    d["outputs"] = {}
+                if not isinstance(d.get("children"), list):
+                    d["children"] = []
+                return d
+
+            def _walk(tasks: List[Dict[str, Any]]):
+                for t in tasks:
+                    yield t
+                    for c in t.get("children", []) or []:
+                        for x in _walk([c]):
+                            yield x
+
+            def _collect_ids(tasks: List[Dict[str, Any]]) -> Set[str]:
+                ids: Set[str] = set()
+                for t in _walk(tasks):
+                    tid = t.get("id")
+                    if isinstance(tid, str) and tid:
+                        ids.add(tid)
+                return ids
+
+            def _validate_taskplan(plan_obj: Dict[str, Any]) -> Dict[str, Any]:
+                issues: List[str] = []
+                suggestions: List[str] = []
+                tasks = plan_obj.get("tasks") if isinstance(plan_obj, dict) else None
+                if not isinstance(tasks, list) or not tasks:
+                    issues.append("no_tasks")
+                    return {"ok": False, "issues": issues, "suggestions": suggestions}
+
+                # Normalize minimal structure and collect ids
+                for i in range(len(tasks)):
+                    tasks[i] = _normalize_task_dict(tasks[i])
+                ids = _collect_ids(tasks)
+
+                # Validate deps reference existing ids when present
+                for t in _walk(tasks):
+                    for dref in (t.get("deps") or []):
+                        if isinstance(dref, str) and dref and dref not in ids:
+                            issues.append(f"dep_missing:{dref}")
+
+                # Composite nodes should not be empty leaves
+                for t in _walk(tasks):
+                    if t.get("kind") == "composite" and not (t.get("children") or []):
+                        suggestions.append(f"split_needed:{t.get('id') or t.get('title')}")
+
+                # Artifact contract surface check (shape only, language-agnostic)
+                def _is_art_list(x: Any) -> bool:
+                    if not isinstance(x, list):
+                        return False
+                    for it in x:
+                        if not isinstance(it, dict):
+                            return False
+                    return True
+
+                for t in _walk(tasks):
+                    ins = t.get("inputs") or {}
+                    outs = t.get("outputs") or {}
+                    if "consumes" in ins and not _is_art_list(ins.get("consumes")):
+                        issues.append("inputs.consumes_not_list")
+                    if "produces" in outs and not _is_art_list(outs.get("produces")):
+                        issues.append("outputs.produces_not_list")
+
+                ok = not issues and (len(suggestions) == 0)
+                return {"ok": ok, "issues": issues, "suggestions": suggestions}
+
+            # Iterative validate/refine loop for TaskPlan
+            def _clamp(n: int) -> int:
+                return max(0, min(5, n))
+
+            max_rounds = 5
+            try:
+                env_val = int(os.environ.get("CRPB_TASKPLAN_REFINE_MAX_ROUNDS", str(max_rounds)))
+                max_rounds = _clamp(env_val)
+            except Exception:
+                max_rounds = _clamp(max_rounds)
+            if isinstance(constraints, dict):
+                try:
+                    mr = int(constraints.get("taskplan_refine_max_rounds", max_rounds))
+                    max_rounds = _clamp(mr)
+                except Exception:
+                    max_rounds = _clamp(max_rounds)
+
+            rounds = 0
+            # Ensure minimal normalization before entering the loop
+            if not isinstance(obj.get("tasks"), list):
+                obj["tasks"] = []
+            obj["tasks"] = [_normalize_task_dict(t) for t in obj.get("tasks", [])]
+
+            while rounds < max_rounds:
+                rounds += 1
+                val = _validate_taskplan(obj)
+                ok = bool(val.get("ok", False))
+                suggestions = val.get("suggestions", []) or []
+                if ok:
+                    break
+
+                prev = json.dumps(obj, sort_keys=True, separators=(",", ":"))
+
+                # 1) Split empty composites deterministically using engine guardrails
+                changed = False
+                tasks_list: List[Dict[str, Any]] = obj.get("tasks", [])
+                def _refine_task_in_place(t: Dict[str, Any], parent: Optional[Dict[str, Any]] = None, siblings: Optional[List[Dict[str, Any]]] = None):
+                    nonlocal changed
+                    t = _normalize_task_dict(t)
+                    # Always consider splitting nodes without children to deepen the tree when warranted
+                    should_consider_split = not (t.get("children") or [])
+                    if should_consider_split:
+                        decision = engine.decide_split(task=t, idea=idea, constraints=constraints)
+                        action = decision.get("action")
+                        children = decision.get("children", []) if isinstance(decision, dict) else []
+                        if action == "split" and children:
+                            t["children"] = [_normalize_task_dict(c) for c in children]
+                            changed = True
+                    # Clarify to enrich fields; always preserve any children
+                    clarified = engine.clarify_task(task=t, parent=parent or {}, siblings=siblings or [], artifacts=[], files={}, idea=idea, constraints=constraints)
+                    if isinstance(clarified, dict) and clarified:
+                        new_t = _normalize_task_dict({**t, **clarified})
+                        new_t["children"] = t.get("children", [])
+                        t.clear(); t.update(new_t)
+                        changed = True
+                    # Recurse on children
+                    ch = t.get("children", []) or []
+                    for idx in range(len(ch)):
+                        _refine_task_in_place(ch[idx], parent=t, siblings=[c for j, c in enumerate(ch) if j != idx])
+
+                for i in range(len(tasks_list)):
+                    _refine_task_in_place(tasks_list[i], parent=None, siblings=[tasks_list[j] for j in range(len(tasks_list)) if j != i])
+
+                # 2) Non-destructive amend pass from the LM (optional)
+                edits_obj = engine.amend_task_plan(current_plan=obj, statuses={}, artifacts=[], idea=idea, constraints=constraints)
+                try:
+                    edits = edits_obj.get("edits", []) if isinstance(edits_obj, dict) else []
+                except Exception:
+                    edits = []
+
+                if edits:
+                    # Apply a minimal subset of safe edits
+                    id_map: Dict[str, Dict[str, Any]] = {}
+                    for t in _walk(obj.get("tasks", [])):
+                        tid = t.get("id")
+                        if isinstance(tid, str) and tid:
+                            id_map[tid] = t
+
+                    def _apply_edit(e: Dict[str, Any]):
+                        nonlocal changed
+                        op = e.get("op")
+                        if op == "edit_task":
+                            tid = e.get("id")
+                            if tid in id_map and isinstance(e.get("fields"), dict):
+                                t = id_map[tid]
+                                new_t = _normalize_task_dict({**t, **e.get("fields", {})})
+                                # preserve children if not explicitly provided
+                                if "children" not in e.get("fields", {}):
+                                    new_t["children"] = t.get("children", [])
+                                t.clear(); t.update(new_t)
+                                changed = True
+                        elif op == "add_child":
+                            pid = e.get("parent_id")
+                            child = _normalize_task_dict(e.get("child") or {})
+                            if pid in id_map:
+                                p = id_map[pid]
+                                ch = p.get("children") or []
+                                ch.append(child)
+                                p["children"] = ch
+                                changed = True
+                        elif op == "add_dep":
+                            tid = e.get("id"); dep = e.get("dep_id")
+                            if tid in id_map and isinstance(dep, str) and dep:
+                                t = id_map[tid]
+                                deps = t.get("deps") or []
+                                if dep not in deps:
+                                    deps.append(dep)
+                                    t["deps"] = deps
+                                    changed = True
+                        elif op == "rewire_artifacts":
+                            tid = e.get("id")
+                            if tid in id_map:
+                                t = id_map[tid]
+                                if isinstance(e.get("consumes"), list):
+                                    ins = t.get("inputs") or {}
+                                    ins["consumes"] = e.get("consumes")
+                                    t["inputs"] = ins
+                                    changed = True
+                                if isinstance(e.get("produces"), list):
+                                    outs = t.get("outputs") or {}
+                                    outs["produces"] = e.get("produces")
+                                    t["outputs"] = outs
+                                    changed = True
+
+                    for ed in edits:
+                        if isinstance(ed, dict):
+                            _apply_edit(ed)
+
+                # If nothing changed this round, stop early
+                cur = json.dumps(obj, sort_keys=True, separators=(",", ":"))
+                if cur == prev or not changed:
+                    break
+
+            # Final validation gate
+            final_val = _validate_taskplan(obj)
+            if not bool(final_val.get("ok", False)):
+                issues = ",".join(final_val.get("issues", []))
+                raise RuntimeError(f"Task planning failed validation: {issues}")
+
+            # Build typed TaskPlan
             def build_task(t: dict) -> TaskSpec:
                 children = [build_task(c) for c in t.get("children", [])]
+                # Normalize deps to strings only (LLM sometimes generates objects)
+                raw_deps = t.get("deps", [])
+                normalized_deps = []
+                if isinstance(raw_deps, list):
+                    for dep in raw_deps:
+                        if isinstance(dep, str):
+                            normalized_deps.append(dep)
+                        elif isinstance(dep, dict) and "id" in dep:
+                            normalized_deps.append(str(dep["id"]))
+                        elif dep is not None:
+                            normalized_deps.append(str(dep))
                 return TaskSpec(
                     id=t.get("id"),
                     kind=t.get("kind", "composite"),
                     title=t.get("title", ""),
                     description=t.get("description", ""),
-                    priority=t.get("priority", "medium"),
-                    deps=t.get("deps", []),
+                    deps=normalized_deps,
                     inputs=t.get("inputs", {}),
                     outputs=t.get("outputs", {}),
                     children=children,
+                    node_plan=t.get("node_plan", {}),
+                    meta=t.get("meta", {}),
                 )
+
             tasks = [build_task(x) for x in obj.get("tasks", [])]
             if not tasks:
                 raise ValueError("empty-task-plan")
+
+            # Spec-first: TaskPlan remains language-agnostic. File specifications live in CodeSpec.
+
             return TaskPlan(idea=idea, constraints=constraints, tasks=tasks)
         except Exception as e:
-            # Always require DSPy; provide a clear, actionable message.
-            raise RuntimeError(
-                f"DSPy task planning failed: {e}. Ensure OPENAI_API_KEY and dspy-ai are installed."
-            )
+            raise RuntimeError(f"Task planning failed: {e}")
     # If use_llm is False or anything else, we still enforce LLM usage to keep behavior strict.
     raise RuntimeError("LLM task planning disabled by configuration, but fallbacks are removed. Enable LLM.")
+
+
+# Spec-first architecture: all file-level specifications are produced as CodeSpec and consumed by build.
+

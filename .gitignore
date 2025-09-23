@@ -1,62 +1,74 @@
-# OS
+# OS-specific junk
 .DS_Store
 Thumbs.db
+Ehthumbs.db
+Icon?
+*.swp
+*.swo
+*.tmp
+*.temp
 
-# Python
+# Python cache/bytecode
 __pycache__/
 *.py[cod]
-*.pyo
-*.pyd
-*.so
-*.egg-info/
-.eggs/
-dist/
+*$py.class
+
+# Python packaging/build
 build/
-pip-wheel-metadata/
-.coverage
-.coverage.*
-.cache/
-.pytest_cache/
-.mypy_cache/
-.pytype/
-.tox/
+dist/
+.eggs/
+*.egg-info/
+*.egg
+
+# Virtual environments
 .venv/
 venv/
 env/
 .venv*/
-*.log
 
-# IDE/Editor
-.vscode/
-.idea/
-*.code-workspace
-
-# CRPB runs and artifacts
-runs/
-run_*/
-crpb/__pycache__/
-scripts/__pycache__/
-
-# Environment & secrets
+# Environment files
 .env
 .env.*
-.env.local
-*.pem
-*.key
+!.env.example
 
-# Node/Web
+# Logs
+*.log
+logs/
+
+# Test/coverage
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache/
+.mypy_cache/
+.pyre/
+.pytype/
+.hypothesis/
+htmlcov/
+coverage.xml
+*.cover
+*.py,cover
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Node (if present; safe to ignore)
 node_modules/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 
-# Coverage
-coverage/
-coverage.xml
-htmlcov/
+# Editors/IDEs
+.vscode/
+.idea/
+*.code-workspace
 
-# Temp files
-.tmp/
-temp/
-*.tmp
+# CRPB generated outputs
+runs/
+outputs/
+
+# Local CRPB config
+.crpb_llm.json

@@ -3,7 +3,18 @@ import time
 from pathlib import Path
 from dataclasses import dataclass
 
-DEFAULT_MODEL = os.environ.get("CRPB_OPENAI_MODEL", "gpt-4o-mini")
+# Provider-specific default model resolution via environment only.
+# We intentionally avoid hardcoded model fallbacks to remain provider-neutral.
+def default_model_for(provider: str) -> str | None:
+    p = (provider or "").lower()
+    if p == "openai":
+        return os.environ.get("CRPB_OPENAI_MODEL")
+    if p == "anthropic":
+        return os.environ.get("CRPB_ANTHROPIC_MODEL")
+    if p == "huggingface":
+        return os.environ.get("CRPB_HF_MODEL")
+    # For other providers, leave unset by default
+    return None
 
 @dataclass
 class RunPaths:

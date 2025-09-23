@@ -16,6 +16,7 @@ def main(
     run_dir: str = typer.Option(None, "--run-dir", help="Base runs folder"),
     run: str = typer.Option("latest", "--run", help="run_<ts> | latest | name"),
     raw: bool = typer.Option(False, "--raw/--compact", help="Print raw JSON events instead of a compact summary"),
+    interval: float = typer.Option(1.0, "--interval", min=0.1, help="Polling interval in seconds"),
 ):
     sep("WATCH")
     base = Path(run_dir) if run_dir else None
@@ -48,4 +49,4 @@ def main(
                 pos = f.tell()
         except FileNotFoundError:
             pass
-        time.sleep(1)
+        time.sleep(interval)

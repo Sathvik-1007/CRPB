@@ -1,38 +1,32 @@
 from __future__ import annotations
-from typing import Tuple, Set, List, Any
-import ast
-import os
-from .specs import FileSpec
+from typing import Tuple, Dict, Any, List, Set
+from pathlib import Path
+from .specs import TaskSpec, TaskPlan
+from .utils.artifacts import ArtifactRegistry
 
 
-def basic_file_validation(fs: FileSpec) -> Tuple[bool, str]:
-    # Allow files with zero functions (e.g., config, README, non-code assets)
-    # Ensure that any declared exports are actually defined in functions
-    if fs.exports:
-        for exp in fs.exports:
-            if exp not in fs.functions:
-                return False, f"Export {exp} not defined in functions"
-    return True, "ok"
-
-
-def validate_assembled_python_file(fs: FileSpec, code: str) -> Tuple[bool, str]:
+def basic_file_validation(fs: Any) -> Tuple[bool, str]:
+    """Language-agnostic, minimal file validation.
+    - Validates that exports, when present, is a list of non-empty strings.
+    - If an entrypoint is specified, it must be present in exports (discipline for runnable modules).
+    Does NOT assume that exports map only to functions (they may refer to classes/constants/unknown).
+    """
     try:
-        tree = ast.parse(code)
-    except SyntaxError as e:
-        return False, f"SyntaxError: {e}"
-    func_names = {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}
-    for required in fs.exports:
-        if required not in func_names:
-            return False, f"Missing required function in assembled code: {required}"
-    return True, "ok"
+        exports = getattr(fs, "exports", [])
+        if exports is None:
+            exports = []
+        if not isinstance(exports, list):
+            return False, "exports_invalid_shape: not a list"
+        for exp in exports:
+            if not isinstance(exp, str) or not exp.strip():
+                return False, "exports_invalid_shape: items must be non-empty strings"
 
-
-def simple_style_check(code: str, max_len: int = 120) -> Tuple[bool, str]:
-    """Very light style check to avoid bringing heavy deps: only line length."""
-    lines = code.splitlines()
-    too_long = [i + 1 for i, ln in enumerate(lines) if len(ln) > max_len]
-    if too_long:
-        return False, f"Lines exceed {max_len} chars: {too_long[:5]}"  # cap list in message
+        entry = getattr(fs, "entrypoint", None)
+        if isinstance(entry, str) and entry.strip():
+            if entry not in exports:
+                return False, f"entrypoint_not_exported:{entry}"
+    except Exception as e:
+        return False, f"basic_file_validation_error:{e}"
     return True, "ok"
 
 
@@ -52,155 +46,309 @@ def jsonschema_validate(data: dict, schema: dict) -> Tuple[bool, str]:
         return False, f"schema_error: {e}"
 
 
-def import_safety_check(code: str, allowed: Set[str] | None = None) -> Tuple[bool, str]:
+# --------------------------- Additional Validators / Gates -------------------------------
+
+# Local language inference to avoid coupling to commands/* modules
+_LANG_BY_EXT = {
+    "py": "python",
+    "ts": "typescript",
+    "tsx": "typescript",
+    "js": "javascript",
+    "jsx": "javascript",
+    "go": "go",
+    "html": "html",
+    "css": "css",
+    "json": "json",
+    "md": "markdown",
+    "toml": "toml",
+    "yaml": "yaml",
+    "yml": "yaml",
+}
+
+
+def infer_language_from_path(path: str | None) -> str | None:
+    if not path:
+        return None
+    ext = (Path(path).suffix or "").lower().lstrip(".")
+    return _LANG_BY_EXT.get(ext)
+
+
+def validate_leaf_readiness(task: TaskSpec) -> Tuple[bool, str, Dict[str, Any]]:
+    """Validate that a leaf `code:function` task has enough information to build.
+    Enforces explicit or inferable language, non-empty path and name, and export discipline.
+    Returns (ok, message, meta) where meta includes effective fields for build.
     """
-    Check that imports in the assembled code are limited to an allowed set.
-    - Primary source of truth should be the file spec's `imports` list.
-    - A minimal stdlib baseline is tolerated (typing, json, re, os, sys, pathlib, time, math, random,
-      collections, itertools, functools, dataclasses). You can extend this baseline by setting the
-      environment variable CRPB_IMPORT_BASELINE to a comma-separated list of additional module names.
-      No third-party packages are permitted unless explicitly declared in the file spec `imports` or
-      included in CRPB_IMPORT_BASELINE.
-    """
-    baseline = {
-        "__future__",
-        "typing",
-        "math",
-        "random",
-        "time",
-        "sys",
-        "os",
-        "dataclasses",
-        "collections",
-        "itertools",
-        "functools",
-        "pathlib",
-        "json",
-        "re",
+    meta: Dict[str, Any] = {}
+    if task.kind != "code:function":
+        return False, "not_a_code_function", meta
+    if task.children:
+        return False, "not_a_leaf", meta
+
+    inputs = task.inputs or {}
+    name = inputs.get("name") or ""
+    path = inputs.get("path") or ""
+    lang = inputs.get("language") or infer_language_from_path(path)
+    exports = list(inputs.get("exports", [name]))
+    imports = list(inputs.get("allowed_imports", []))
+    entry = inputs.get("entrypoint")
+    sig = inputs.get("signature")
+
+    if not isinstance(path, str) or not path.strip():
+        return False, "missing_input:path", meta
+    if not isinstance(name, str) or not name.strip():
+        return False, "missing_input:name", meta
+    if not (isinstance(lang, str) and lang.strip()):
+        return False, "language_required_or_inferable", meta
+
+    if isinstance(entry, str) and entry and entry not in exports:
+        exports = exports + [entry]
+
+    meta = {
+        "path": path,
+        "name": name,
+        "language": lang,
+        "exports": exports,
+        "imports": imports,
+        "entrypoint": entry if isinstance(entry, str) else None,
+        "signature": sig if isinstance(sig, str) else None,
     }
-    extra = os.getenv("CRPB_IMPORT_BASELINE", "")
-    if extra:
-        for token in extra.replace(";", ",").split(","):
-            mod = token.strip()
-            if mod:
-                baseline.add(mod)
-    allowed = set(allowed or set()) | baseline
+    return True, "ok", meta
+
+
+def validate_artifact_gating(
+    *,
+    task: TaskSpec,
+    registry: ArtifactRegistry,
+    base_dir: Path,
+    require_valid: bool = True,
+) -> Tuple[bool, str]:
+    """Gate a task on consumed artifacts: they must exist (and be valid when required)."""
     try:
-        tree = ast.parse(code)
-    except SyntaxError as e:
-        return False, f"SyntaxError before import check: {e}"
-    violations: list[str] = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                mod = (alias.name or "").split(".")[0]
-                if mod not in allowed:
-                    violations.append(mod)
-        elif isinstance(node, ast.ImportFrom):
-            mod = (node.module or "").split(".")[0]
-            if mod and mod not in allowed:
-                violations.append(mod)
-    if violations:
-        uniq = sorted(set(violations))
-        return False, f"disallowed_imports: {uniq}"
-    return True, "ok"
-
-
-def integrity_check(fs: FileSpec, code: str) -> Tuple[bool, str]:
-    """
-    Static integrity checks after assembly:
-    - If fs.entrypoint is set, ensure function exists in the code.
-    - If fs.imports is set, ensure an import header exists for each module.
-    Does not execute code; runtime checks are out of scope here.
-    """
-    try:
-        tree = ast.parse(code)
-    except SyntaxError as e:
-        return False, f"SyntaxError before integrity: {e}"
-    # Check entrypoint function exists
-    if getattr(fs, "entrypoint", None):
-        func_names = {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}
-        if fs.entrypoint not in func_names:
-            return False, f"entrypoint_missing: {fs.entrypoint}"
-    # Check import headers
-    imports = getattr(fs, "imports", []) or []
-    if imports:
-        # Build a set of top-level imported module names from AST
-        present: Set[str] = set()
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    if alias.name:
-                        present.add(alias.name.split(".")[0])
-            elif isinstance(node, ast.ImportFrom):
-                if node.module:
-                    present.add(node.module.split(".")[0])
-        missing = [m for m in imports if m.split(".")[0] not in present]
-        if missing:
-            return False, f"missing_import_headers: {missing}"
-    return True, "ok"
-
-
-def _load_module_from_file(module_name: str, file_path: str):
-    import importlib.util
-    spec = importlib.util.spec_from_file_location(module_name, file_path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"cannot load module from {file_path}")
-    mod = importlib.util.module_from_spec(spec)
-    try:
-        spec.loader.exec_module(mod)  # type: ignore[attr-defined]
+        raw = []
+        if isinstance(task.inputs, dict):
+            c = task.inputs.get("consumes")
+            if isinstance(c, list):
+                raw = c
+            elif c is None:
+                raw = []
+            else:
+                raw = [c]
+        # Normalize to dict refs
+        refs: List[Dict[str, Any]] = []
+        for r in raw:
+            if isinstance(r, str):
+                refs.append({"id": r})
+            elif isinstance(r, dict):
+                refs.append(r)
+        # Check gating
+        for ref in refs:
+            if not registry.exists(ref, base_dir=base_dir):
+                return False, "artifact_missing"
+            if require_valid:
+                v = registry.get_validation(ref)
+                if not v or not v.get("ok", False):
+                    return False, "artifact_not_validated"
+        return True, "ok"
     except Exception as e:
-        raise ImportError(f"module_exec_error: {e}")
-    return mod
+        return False, f"artifact_gate_error:{e}"
 
 
-def runtime_validate_examples(fs: FileSpec, assembled_path: str) -> Tuple[bool, List[dict]]:
+def validate_taskplan_structure(tp: TaskPlan) -> Tuple[bool, List[str]]:
+    """Lightweight structure check: unique ids and kind sanity. No LLM calls."""
+    issues: List[str] = []
+    seen: set[str] = set()
+
+    def walk(ts: List[TaskSpec]) -> None:
+        for t in ts:
+            tid = str(getattr(t, "id", ""))
+            if not tid:
+                issues.append("task_missing_id")
+            elif tid in seen:
+                issues.append(f"duplicate_id:{tid}")
+            else:
+                seen.add(tid)
+            k = getattr(t, "kind", "")
+            if k not in ("composite", "code:function"):
+                issues.append(f"unknown_kind:{k}")
+            walk(getattr(t, "children", []))
+
+    walk(list(getattr(tp, "tasks", [])))
+    return (len(issues) == 0), issues
+
+
+def validate_taskplan_general(tp: TaskPlan) -> Dict[str, Any]:
     """
-    Execute FunctionSpec.examples against the assembled file.
-    - Each example.inp is treated as kwargs by default. If it contains 'args' (list) and/or 'kwargs' (dict), use them.
-    - Compare return value to example.out via ==.
-    Returns (ok_all, results[]). Each result has: {function, ok, expected, got, error?}
-    """
-    results: List[dict] = []
-    if not fs.functions:
-        return True, results
-    # If there are no examples for any function in this file, skip runtime import/execution.
-    total_examples = sum(len(f.examples) for f in fs.functions.values())
-    if total_examples == 0:
-        return True, results
-    mod_name = "crpb_runtime_" + str(abs(hash(assembled_path)))
-    try:
-        mod = _load_module_from_file(mod_name, assembled_path)
-    except Exception as e:
-        return False, [{"function": "*", "ok": False, "error": str(e)}]
+    General, logical validation of a TaskPlan (language-agnostic, world-class guardrails):
+    - Node structure: non-empty title/kind, atomic vs. children coherence.
+    - Node plan presence: expect a dict with core fields (intent, acceptance_criteria, test_plan).
+    - Deps: uniqueness of ids, valid references, acyclic DAG.
+    - Artifact shape: inputs.consumes / outputs.produces arrays of dicts with at least 'id'.
 
-    ok_all = True
-    for fname, fmeta in fs.functions.items():
-        if not fmeta.examples:
-            continue
-        fn = getattr(mod, fname, None)
-        if not callable(fn):
-            results.append({"function": fname, "ok": False, "error": "function_missing_in_module"})
-            ok_all = False
-            continue
-        for ex in fmeta.examples:
+    Returns a dict report: {"ok": bool, "issues": string[], "nodes": [{"id":str,"path":str,"issues":string[]}]}
+    Path values prefer task.meta.path when present, otherwise computed 1-based dotted index.
+    """
+    issues: List[str] = []
+    node_reports: List[Dict[str, Any]] = []
+
+    # Flatten with paths and id index
+    id_index: Dict[str, TaskSpec] = {}
+
+    def _walk(ts: List[TaskSpec], parent_path: str = "") -> List[str]:
+        paths: List[str] = []
+        for idx, t in enumerate(ts or [], start=1):
+            path = f"{parent_path}.{idx}" if parent_path else str(idx)
+            # Prefer precomputed meta.path if available
             try:
-                if isinstance(ex.inp, dict) and ("args" in ex.inp or "kwargs" in ex.inp):
-                    args = list(ex.inp.get("args", []))
-                    kwargs = dict(ex.inp.get("kwargs", {}))
-                    got: Any = fn(*args, **kwargs)
-                elif isinstance(ex.inp, dict):
-                    got = fn(**ex.inp)
-                elif isinstance(ex.inp, list):
-                    got = fn(*ex.inp)
+                p2 = getattr(t, "meta", {}).get("path") if isinstance(getattr(t, "meta", {}), dict) else None  # type: ignore[call-arg]
+            except Exception:
+                p2 = None
+            path_use = p2 or path
+            tid = str(getattr(t, "id", "") or "")
+            if tid:
+                if tid in id_index:
+                    issues.append(f"duplicate_id:{tid}")
                 else:
-                    # scalar input treated as single positional arg
-                    got = fn(ex.inp)
-                ok = got == ex.out
-                if not ok:
-                    ok_all = False
-                results.append({"function": fname, "ok": ok, "expected": ex.out, "got": got})
-            except Exception as e:
-                ok_all = False
-                results.append({"function": fname, "ok": False, "error": f"exec_error: {e}"})
-    return ok_all, results
+                    id_index[tid] = t
+            # Node-level checks (general)
+            n_issues: List[str] = []
+            k = getattr(t, "kind", "")
+            if not isinstance(k, str) or not k.strip():
+                n_issues.append("missing_kind")
+            title = getattr(t, "title", "")
+            if not isinstance(title, str) or not title.strip():
+                n_issues.append("missing_title")
+            # Atomic vs children coherence
+            children = list(getattr(t, "children", []) or [])
+            atomic_flag = False
+            try:
+                atomic_flag = bool((getattr(t, "meta", {}) or {}).get("atomic"))
+            except Exception:
+                atomic_flag = False
+            if atomic_flag and children:
+                n_issues.append("atomic_has_children")
+            if (not atomic_flag) and (not children) and k == "composite":
+                n_issues.append("composite_without_children")
+            # Node plan presence (core fields)
+            np = getattr(t, "node_plan", {}) or {}
+            if not isinstance(np, dict):
+                n_issues.append("node_plan_missing_or_invalid")
+            else:
+                for core in ("intent", "acceptance_criteria", "test_plan"):
+                    if core not in np:
+                        n_issues.append(f"node_plan_missing:{core}")
+            # Artifact shape check
+            def _chk_art(shape: Dict[str, Any] | None, key: str) -> None:
+                if not isinstance(shape, dict):
+                    return
+                arr = shape.get(key)
+                if arr is None:
+                    return
+                if not isinstance(arr, list):
+                    n_issues.append(f"{key}_not_list")
+                    return
+                for it in arr:
+                    if not (isinstance(it, dict) and isinstance(it.get("id"), str) and it.get("id").strip()):
+                        n_issues.append(f"{key}_item_invalid")
+                        break
+            _chk_art(getattr(t, "inputs", {}) or {}, "consumes")
+            _chk_art(getattr(t, "outputs", {}) or {}, "produces")
+
+            if n_issues:
+                node_reports.append({"id": tid, "path": path_use, "issues": n_issues})
+            paths.append(path_use)
+            # Recurse
+            _walk(children, path_use)
+        return paths
+
+    _walk(list(getattr(tp, "tasks", []) or []))
+
+    # Deps validity and cycle detection
+    # Build adjacency
+    adj: Dict[str, List[str]] = {}
+    for tid, t in id_index.items():
+        try:
+            adj[tid] = [d for d in (getattr(t, "deps", []) or []) if isinstance(d, str) and d]
+        except Exception:
+            adj[tid] = []
+    # Unknown deps
+    for tid, deps in adj.items():
+        for d in deps:
+            if d not in id_index:
+                issues.append(f"unknown_dep:{tid}->{d}")
+
+    # Cycle detection via DFS
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color: Dict[str, int] = {tid: WHITE for tid in adj.keys()}
+    def _dfs(u: str, stack: List[str]) -> None:
+        color[u] = GRAY
+        stack.append(u)
+        for v in adj.get(u, []):
+            if color.get(v, WHITE) == WHITE:
+                _dfs(v, stack)
+            elif color.get(v) == GRAY:
+                cycle = stack[stack.index(v):] + [v]
+                issues.append("cycle:" + "->".join(cycle))
+        color[u] = BLACK
+        stack.pop()
+    for tid in list(adj.keys()):
+        if color[tid] == WHITE:
+            _dfs(tid, [])
+
+    # Artifact coverage index (producers/consumers) + coverage issues
+    art_index: Dict[str, Dict[str, List[str]]] = {}
+    def _norm(val: Any) -> List[Dict[str, Any]]:
+        if isinstance(val, list):
+            arr = val
+        elif val is None:
+            arr = []
+        else:
+            arr = [val]
+        out: List[Dict[str, Any]] = []
+        for r in arr:
+            if isinstance(r, str):
+                rid = r.strip()
+                if rid:
+                    out.append({"id": rid})
+            elif isinstance(r, dict):
+                rid = r.get("id")
+                if isinstance(rid, str) and rid.strip():
+                    out.append(r)
+        return out
+    def _collect(ts: List[TaskSpec], parent_path: str = "") -> None:
+        for idx, t in enumerate(ts or [], start=1):
+            # Path
+            try:
+                meta = getattr(t, "meta", {}) or {}
+            except Exception:
+                meta = {}
+            path = meta.get("path") or (f"{parent_path}.{idx}" if parent_path else str(idx))
+            outs = getattr(t, "outputs", {}) or {}
+            ins = getattr(t, "inputs", {}) or {}
+            prods = _norm(outs.get("produces")) if isinstance(outs, dict) else []
+            cons = _norm(ins.get("consumes")) if isinstance(ins, dict) else []
+            for ref in prods:
+                rid = ref.get("id")
+                if not rid:
+                    continue
+                ent = art_index.setdefault(rid, {"producers": [], "consumers": []})
+                if path not in ent["producers"]:
+                    ent["producers"].append(path)
+            for ref in cons:
+                rid = ref.get("id")
+                if not rid:
+                    continue
+                ent = art_index.setdefault(rid, {"producers": [], "consumers": []})
+                if path not in ent["consumers"]:
+                    ent["consumers"].append(path)
+            _collect(getattr(t, "children", []) or [], path)
+    _collect(list(getattr(tp, "tasks", []) or []))
+
+    # Coverage issues (general, neutral)
+    for rid, ent in art_index.items():
+        if not ent.get("producers"):
+            issues.append(f"artifact_no_producer:{rid}")
+        if not ent.get("consumers"):
+            issues.append(f"artifact_no_consumer:{rid}")
+
+    ok = not issues and not any(n.get("issues") for n in node_reports)
+    return {"ok": ok, "issues": issues, "nodes": node_reports, "artifacts": {"index": art_index}}

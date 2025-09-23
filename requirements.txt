@@ -1,10 +1,19 @@
-typer==0.12.3
-click==8.1.7
-pydantic==2.7.1
-openai>=1.30.0
-python-dotenv==1.0.1
-rich==13.7.1
-portalocker==2.8.2
-tqdm==4.66.4
-jsonschema==4.22.0
-dspy-ai>=2.5.0
+# Core CLI and formatting
+typer>=0.9.0,<1.0.0
+rich>=13.6,<14
+python-dotenv>=1.0.0,<2.0.0
+
+# Models and validation
+pydantic>=2.4,<3
+jsonschema>=4.18,<5
+
+# Concurrency and file locks
+portalocker>=2.8,<3
+
+# LLM integrations
+openai>=1.0.0,<2
+# DSPy orchestration engine (required by crpb/agents/dspy_engine.py)
+dspy-ai>=2.4.0,<3
+
+# Robust JSON repair used to parse LLM outputs safely
+json-repair>=0.3,<1
