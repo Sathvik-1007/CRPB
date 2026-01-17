@@ -1,5 +1,7 @@
 from __future__ import annotations
-from typing import List, Dict, Tuple
+
+from typing import Dict, List, Tuple
+
 
 class Scheduler:
     def __init__(self, max_parallel_children: int = 4):
@@ -22,12 +24,21 @@ class Scheduler:
         for fpath, fdata in files.items():
             funcs = fdata.get("functions", {})
             # precompute implemented map (same-file)
-            implemented_in_file = {name for name, meta in funcs.items() if meta.get("status") == "implemented"}
+            implemented_in_file = {
+                name for name, meta in funcs.items() if meta.get("status") == "implemented"
+            }
             for name, meta in funcs.items():
                 if meta.get("status") != "stub":
                     continue
                 deps = meta.get("deps", [])
-                def _dep_satisfied(dep: str) -> bool:
+
+                def _dep_satisfied(
+                    dep: str,
+                    *,
+                    funcs=funcs,
+                    implemented_in_file=implemented_in_file,
+                    files=files,
+                ) -> bool:
                     # same-file dep must be implemented in the same file
                     if dep in funcs:
                         return dep in implemented_in_file

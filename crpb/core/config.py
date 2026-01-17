@@ -1,7 +1,8 @@
 import os
 import time
-from pathlib import Path
 from dataclasses import dataclass
+from pathlib import Path
+
 
 # Provider-specific default model resolution via environment only.
 # We intentionally avoid hardcoded model fallbacks to remain provider-neutral.
@@ -11,10 +12,15 @@ def default_model_for(provider: str) -> str | None:
         return os.environ.get("CRPB_OPENAI_MODEL")
     if p == "anthropic":
         return os.environ.get("CRPB_ANTHROPIC_MODEL")
+    if p == "cerebras":
+        return os.environ.get("CRPB_CEREBRAS_MODEL")
     if p == "huggingface":
         return os.environ.get("CRPB_HF_MODEL")
+    if p == "azure_foundry":
+        return os.environ.get("CRPB_AZURE_FOUNDRY_DEPLOYMENT")
     # For other providers, leave unset by default
     return None
+
 
 @dataclass
 class RunPaths:
@@ -58,6 +64,27 @@ def make_paths(run: Path) -> RunPaths:
     repair_plans = run / "repair_plans"
     logs = run / "logs"
     outputs = run / "outputs"
-    for p in (plan, graph, registry, specs, artifacts, validations, repair_plans, logs, outputs):
+    for p in (
+        plan,
+        graph,
+        registry,
+        specs,
+        artifacts,
+        validations,
+        repair_plans,
+        logs,
+        outputs,
+    ):
         p.mkdir(parents=True, exist_ok=True)
-    return RunPaths(run, plan, graph, registry, specs, artifacts, validations, repair_plans, logs, outputs)
+    return RunPaths(
+        run,
+        plan,
+        graph,
+        registry,
+        specs,
+        artifacts,
+        validations,
+        repair_plans,
+        logs,
+        outputs,
+    )

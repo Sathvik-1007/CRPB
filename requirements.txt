@@ -7,13 +7,22 @@ python-dotenv>=1.0.0,<2.0.0
 pydantic>=2.4,<3
 jsonschema>=4.18,<5
 
+# Optional acceleration (used for fast TODO grouping/sorting in repair loop)
+pandas>=2.1,<3
+
 # Concurrency and file locks
 portalocker>=2.8,<3
 
 # LLM integrations
 openai>=1.0.0,<2
+anthropic>=0.7.0
 # DSPy orchestration engine (required by crpb/agents/dspy_engine.py)
 dspy-ai>=2.4.0,<3
+huggingface-hub>=0.20.0
+cerebras-cloud-sdk>=0.6.0
 
 # Robust JSON repair used to parse LLM outputs safely
-json-repair>=0.3,<1
+json-repair>=0.13,<1
+
+# Temporal orchestration layer
+temporalio>=1.0,<2

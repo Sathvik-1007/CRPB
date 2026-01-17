@@ -1,0 +1,81 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "crpb"
+version = "0.1.0"
+description = "Context Recursive Project Builder - A language-agnostic, spec-driven project builder"
+readme = "README.md"
+license = {file = "LICENSE"}
+authors = [
+    {name = "CRPB Contributors"}
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "typer[rich]>=0.9.0",
+    "pydantic>=2.0.0",
+    "dspy-ai>=2.4.0",
+    "temporalio>=1.4.0",
+    "portalocker>=2.7.0",
+    "rich>=13.0.0",
+    "json-repair>=0.13.0",
+    "anthropic>=0.7.0",
+    "openai>=1.0.0",
+    "huggingface-hub>=0.20.0",
+    "cerebras-cloud-sdk>=0.6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0.0",
+    "types-json-repair>=0.13",
+]
+
+[project.urls]
+Homepage = "https://github.com/crpb/crpb"
+Repository = "https://github.com/crpb/crpb"
+Documentation = "https://github.com/crpb/crpb/docs"
+
+[project.scripts]
+crpb = "crpb.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["crpb*"]
+
+[tool.black]
+line-length = 100
+target-version = ['py310']
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+# Keep Ruff focused on correctness + imports; avoid noisy/large refactors.
+select = ["E", "F", "W", "I", "B", "C4"]
+ignore = ["E501", "B008", "B904"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["runs", "dist", "build", ".venv", "venv", "__pycache__"]

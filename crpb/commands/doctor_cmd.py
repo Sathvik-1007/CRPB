@@ -1,15 +1,18 @@
 from __future__ import annotations
+
 from pathlib import Path
+
 import typer
 from rich.console import Console
-from ..config import resolve_run_dir, make_paths
-from ..eventbus import EventBus
-from ..status import NodeStatus
-from ..leases import Leases
+
+from ..core.config import make_paths, resolve_run_dir
+from ..core.eventbus import EventBus
+from ..core.leases import Leases
+from ..core.status import NodeStatus
 from ..utils.fs import atomic_write_json, ensure_parent
 from ..utils.ui import sep
 
-app = typer.Typer(help="Create a deterministic scaffold without LLM calls")
+app = typer.Typer(help="Verify CRPB's local scaffolding (no LLM/provider calls)")
 console = Console()
 
 
@@ -17,10 +20,12 @@ console = Console()
 def main(
     run_dir: str = typer.Option(None, "--run-dir", help="Base runs folder"),
     run: str = typer.Option("new", "--run", help="run_<ts> | latest | new | name"),
-    node_id: str = typer.Option(None, "--node-id", help="Deterministic node id for this dry-run"),
-    parent_id: str = typer.Option(None, "--parent-id", help="Parent node id for orchestration tracking"),
+    node_id: str = typer.Option(None, "--node-id", help="Deterministic node id for this run"),
+    parent_id: str = typer.Option(
+        None, "--parent-id", help="Parent node id for orchestration tracking"
+    ),
 ):
-    sep("DRY-RUN START")
+    sep("DOCTOR")
     base = Path(run_dir) if run_dir else None
     run_path = resolve_run_dir(base, run)
     paths = make_paths(run_path)
@@ -34,7 +39,7 @@ def main(
     (paths.graph / "edges.jsonl").touch(exist_ok=True)
     atomic_write_json(paths.graph / "leases.json", {})
     atomic_write_json(paths.registry / "registry.json", {"version": 0, "files": {}})
-    # align with plan.md: create a stubs directory under registry/
+    # align with docs/design/plan.md: create a stubs directory under registry/
     (paths.registry / "stubs").mkdir(parents=True, exist_ok=True)
     # validations/repair_plans/ is a directory, created by make_paths(); no file creation here
 
@@ -44,7 +49,7 @@ def main(
 
     # simple demo lifecycle
     sep("LIFECYCLE")
-    node_id = node_id or f"dryrun::{run_path.name}"
+    node_id = node_id or f"doctor::{run_path.name}"
     parent_id = parent_id or f"root::{run_path.name}"
     status.write(node_id, "CREATED", parent_id=parent_id)
     lease_id = leases.grant(node_id, ttl=120)
@@ -55,5 +60,5 @@ def main(
     status.write(node_id, "DONE", prev_state="LEASED", parent_id=parent_id)
     bus.emit("NODE_DONE", node_id=node_id, parent_id=parent_id)
 
-    sep("DRY-RUN DONE")
-    console.print(f"[green]Dry-run scaffold created[/green] at: {run_path}")
+    sep("DOCTOR DONE")
+    console.print(f"[green]Doctor check passed[/green] at: {run_path}")

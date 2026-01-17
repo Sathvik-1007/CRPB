@@ -1,10 +1,14 @@
 from __future__ import annotations
-from pathlib import Path
+
 import json
+import os
+from pathlib import Path
+
 import typer
 from rich.console import Console
 from rich.table import Table
-from ..config import resolve_run_dir, make_paths
+
+from ..core.config import make_paths, resolve_run_dir
 from ..utils.ui import sep
 
 app = typer.Typer(help="Replay events.jsonl to produce a summary rollup")
@@ -14,7 +18,7 @@ console = Console()
 def _iter_events(path: Path):
     if not path.exists():
         return
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -29,7 +33,9 @@ def _iter_events(path: Path):
 def main(
     run_dir: str = typer.Option(None, "--run-dir", help="Base runs folder"),
     run: str = typer.Option("latest", "--run", help="run_<ts> | latest | name"),
-    write: bool = typer.Option(True, "--write/--no-write", help="Write rollup to outputs/rollups/status.json"),
+    write: bool = typer.Option(
+        True, "--write/--no-write", help="Write rollup to outputs/rollups/status.json"
+    ),
 ):
     sep("REPLAY")
     base = Path(run_dir) if run_dir else None
@@ -43,7 +49,7 @@ def main(
         "first_event_at": None,
         "last_event_at": None,
         "functions": {},  # key path::name -> {last_event, first_at, last_at, future_wait, future_ready, timeline}
-        "tasks": {},      # task_id -> {kind, last_event, first_at, last_at, assigned, split, done, failed, timeline}
+        "tasks": {},  # task_id -> {kind, last_event, first_at, last_at, assigned, split, done, failed, timeline}
     }
 
     for evt in _iter_events(events_path):
@@ -52,8 +58,12 @@ def main(
         payload = evt.get("payload", {})
         status["counts"][et] = status["counts"].get(et, 0) + 1
         if at is not None:
-            status["first_event_at"] = at if status["first_event_at"] is None else min(status["first_event_at"], at)
-            status["last_event_at"] = at if status["last_event_at"] is None else max(status["last_event_at"], at)
+            status["first_event_at"] = (
+                at if status["first_event_at"] is None else min(status["first_event_at"], at)
+            )
+            status["last_event_at"] = (
+                at if status["last_event_at"] is None else max(status["last_event_at"], at)
+            )
         node_id = payload.get("node_id")
         if node_id:
             status["nodes"][node_id] = et
@@ -64,7 +74,14 @@ def main(
             key = f"{fpath}::{fname}"
             rec = status["functions"].setdefault(
                 key,
-                {"last_event": None, "first_at": None, "last_at": None, "future_wait": 0, "future_ready": 0, "timeline": []},
+                {
+                    "last_event": None,
+                    "first_at": None,
+                    "last_at": None,
+                    "future_wait": 0,
+                    "future_ready": 0,
+                    "timeline": [],
+                },
             )
             rec["last_event"] = et
             if at is not None:
@@ -79,7 +96,7 @@ def main(
         # per-task rollup (TaskPlan recursive flow)
         norm = et
         if isinstance(et, str) and et.startswith("CHILD_"):
-            norm = "TASK_" + et[len("CHILD_"):]
+            norm = "TASK_" + et[len("CHILD_") :]
         if norm in ("TASK_ASSIGNED", "TASK_SPLIT", "TASK_DONE", "TASK_FAILED"):
             tid = payload.get("task_id")
             if tid:
@@ -115,7 +132,7 @@ def main(
     table = Table(title="Replay Summary")
     table.add_column("Metric")
     table.add_column("Value")
-    table.add_row("Nodes", str(len(status["nodes"])) )
+    table.add_row("Nodes", str(len(status["nodes"])))
     table.add_row("Events", str(sum(status["counts"].values())))
     table.add_row("First At", str(status["first_event_at"]))
     table.add_row("Last At", str(status["last_event_at"]))
@@ -130,6 +147,13 @@ def main(
         console.print(t2)
 
     if status["tasks"]:
+        try:
+            max_tasks = int(os.environ.get("CRPB_REPLAY_MAX_TASKS", "100"))
+        except Exception:
+            max_tasks = 100
+        if max_tasks <= 0:
+            max_tasks = 100
+
         t_tasks = Table(title="Tasks (TaskPlan rollup)")
         t_tasks.add_column("Task ID")
         t_tasks.add_column("Kind")
@@ -138,8 +162,10 @@ def main(
         t_tasks.add_column("SPLIT")
         t_tasks.add_column("DONE")
         t_tasks.add_column("FAILED")
-        # show up to 100 tasks
-        for tid, trec in list(status["tasks"].items())[:100]:
+        # show up to max_tasks tasks (full rollup is written to outputs/rollups/status.json)
+        for i, (tid, trec) in enumerate(status["tasks"].items()):
+            if i >= max_tasks:
+                break
             t_tasks.add_row(
                 tid,
                 str(trec.get("kind")),
@@ -151,6 +177,11 @@ def main(
             )
         console.print(t_tasks)
 
+        if len(status["tasks"]) > max_tasks:
+            console.print(
+                f"[yellow]Tasks truncated in display[/yellow]: showing={max_tasks} total={len(status['tasks'])} (see rollup file)"
+            )
+
     if status["functions"]:
         t3 = Table(title="Functions (timeline + futures)")
         t3.add_column("Function")
@@ -158,7 +189,9 @@ def main(
         t3.add_column("FUTURE_WAIT")
         t3.add_column("FUTURE_READY")
         for key, rec in status["functions"].items():
-            t3.add_row(key, str(rec["last_event"]), str(rec["future_wait"]), str(rec["future_ready"]))
+            t3.add_row(
+                key, str(rec["last_event"]), str(rec["future_wait"]), str(rec["future_ready"])
+            )
         console.print(t3)
 
     if write:

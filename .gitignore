@@ -1,74 +1,84 @@
-# OS-specific junk
-.DS_Store
-Thumbs.db
-Ehthumbs.db
-Icon?
-*.swp
-*.swo
-*.tmp
-*.temp
-
-# Python cache/bytecode
+# Python
 __pycache__/
 *.py[cod]
-*$py.class
-
-# Python packaging/build
-build/
-dist/
-.eggs/
+*.pyo
+*.pyd
+*.so
 *.egg-info/
+.dist/
+dist/
+build/
+
+# Wheels / packaging
+.eggs/
+pip-wheel-metadata/
+*.whl
 *.egg
 
-# Virtual environments
+# Virtual envs
 .venv/
 venv/
-env/
-.venv*/
+ENV/
 
-# Environment files
-.env
-.env.*
-!.env.example
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
 
-# Logs
+# Type check / language server
+.pyright/
+.python-version
+
+# IDE
+.vscode/
+.idea/
+
+# CRPB outputs
+runs/
+
+# Logs / temp
 *.log
 logs/
+tmp/
+temp/
 
-# Test/coverage
-.pytest_cache/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache/
-.mypy_cache/
-.pyre/
-.pytype/
-.hypothesis/
-htmlcov/
-coverage.xml
-*.cover
-*.py,cover
+# Local machine config
+.crpb_llm.json
 
-# Jupyter
-.ipynb_checkpoints/
+# Local state
+*.lock
 
-# Node (if present; safe to ignore)
+# Local binaries / doc dumps (see docs/checklists/GITHUB_PUSH_CHECKLIST.md)
+tools/temporal/temporal.exe
+docs/references/dspy-full-docs.md
+docs/references/temporal-docs.md
+docs/references/h.md
+
+# Node / frontend (generated)
 node_modules/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
+.npm/
+.yarn/
+.pnp.*
 
-# Editors/IDEs
-.vscode/
-.idea/
-*.code-workspace
+# Temporal local state (if present)
+.temporal/
+temporal-data/
 
-# CRPB generated outputs
-runs/
-outputs/
+# Secrets
+.env
+.env.*
+!.env.example
 
-# Local CRPB config
-.crpb_llm.json
+# OS
+.DS_Store
+Thumbs.db
+
+# Local doc dumps
+2512.24601v1.pdf

@@ -1,56 +1,90 @@
 from __future__ import annotations
+
 import hashlib
 import json
-import time
 import os
+import time
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Annotated, Any
+from typing import Annotated, Any, Dict, List, Optional, Tuple
+
 import typer
 from rich.console import Console
 
-from ..config import resolve_run_dir, make_paths
-from ..eventbus import EventBus
-from ..status import NodeStatus
-from ..leases import Leases
-from ..utils.fs import ensure_parent, atomic_write_json, lock_file
-from ..utils.ui import sep
-from ..scheduler import Scheduler
-from ..planner import generate_task_plan
-from ..specs import TaskSpec, TaskPlan, CodeSpec, CodeSpecFile
 from ..agents.dspy_engine import DspyEngine
-from ..utils.artifacts import ArtifactRegistry
-from ..validator import (
-    validate_leaf_readiness,
-    validate_artifact_gating,
-    infer_language_from_path,
+from ..core.config import make_paths, resolve_run_dir
+from ..core.context_compiler import ContextCompiler
+from ..core.eventbus import EventBus
+from ..core.leases import Leases
+from ..core.ledger import NodeLedgerStore, TodoItem
+from ..core.llm_config import load_selection, require_env_vars
+from ..core.obligations import (
+    extract_obligations_from_node,
+    format_structured_todo_text,
+    stable_todo_id_from_obligation,
 )
-from ..llm_config import load_selection, require_env_vars
+from ..core.scheduler import Scheduler
+from ..core.specs import CodeSpec, CodeSpecFile, TaskPlan, TaskSpec
+from ..core.status import NodeStatus
+from ..planning.planner import generate_task_plan
+from ..utils.artifacts import ArtifactRegistry
+from ..utils.fs import atomic_write_json, ensure_parent, write_text_locked
+from ..utils.payloads import externalize_json, externalize_text
+from ..utils.ui import sep
+from ..validation.coverage import compute_obligation_coverage
+from ..validation.validator import (
+    validate_leaf_readiness,
+    validate_taskplan_general,
+)
 
-app = typer.Typer(help="Execute a hierarchical TaskPlan with recursive LLM-driven split-or-implement orchestration")
+app = typer.Typer(
+    help="Execute a hierarchical TaskPlan with recursive LLM-driven split-or-implement orchestration"
+)
 console = Console()
 
 
-# --- Local helper replacing deprecated aggregator function ---
-def write_code_file(path: Path, text: str) -> None:
-    """Safely write text content to a file, ensuring parent directories exist."""
-    ensure_parent(path)
-    # Use a sidecar lock file to coordinate concurrent writers across processes
-    lock_path = path.parent / (path.name + ".lock")
-    with lock_file(lock_path):
-        path.write_text(text, encoding="utf-8")
-
-
-def _normalize_ids(tasks: List[TaskSpec]) -> None:
+def _normalize_ids(
+    tasks: List[TaskSpec],
+    *,
+    existing_index: Dict[str, TaskSpec] | None = None,
+) -> None:
     counter = 0
+    seen: set[str] = set(existing_index.keys()) if existing_index else set()
 
-    def walk(ts: List[TaskSpec]):
-        nonlocal counter
+    def collect(ts: List[TaskSpec]) -> None:
         for t in ts:
-            if not t.id:
-                t.id = f"t_{counter}"
-                counter += 1
-            walk(t.children)
+            tid = getattr(t, "id", None)
+            if isinstance(tid, str) and tid:
+                seen.add(tid)
+            collect(list(getattr(t, "children", []) or []))
 
+    def next_id() -> str:
+        nonlocal counter
+        while True:
+            cand = f"t_{counter}"
+            counter += 1
+            if cand not in seen:
+                seen.add(cand)
+                return cand
+
+    def walk(ts: List[TaskSpec]) -> None:
+        for t in ts:
+            tid = getattr(t, "id", None)
+            if isinstance(tid, str) and tid:
+                # If this id already exists but refers to a different object, rename deterministically.
+                if existing_index is not None:
+                    other = existing_index.get(tid)
+                    if other is not None and other is not t:
+                        t.id = next_id()
+                    else:
+                        seen.add(tid)
+                else:
+                    seen.add(tid)
+            else:
+                t.id = next_id()
+            walk(list(getattr(t, "children", []) or []))
+
+    # Seed with any ids already present in this subtree
+    collect(tasks)
     walk(tasks)
 
 
@@ -71,6 +105,8 @@ class BuildFromTaskPlan:
         constraints: dict,
         file_meta_by_path: Dict[str, Dict],
         codespec: Optional[CodeSpec] = None,
+        ledger_store: NodeLedgerStore | None = None,
+        context_compiler: ContextCompiler | None = None,
     ) -> None:
         self.engine = engine
         self.registry = registry
@@ -80,6 +116,8 @@ class BuildFromTaskPlan:
         self.file_meta_by_path = file_meta_by_path
         self.codespec = codespec or CodeSpec()
         self._file_specs_by_path: Dict[str, CodeSpecFile] = {}
+        self.ledger_store = ledger_store
+        self.context_compiler = context_compiler
 
     def _normalize_artifact_ref(self, x):
         if isinstance(x, str):
@@ -89,6 +127,24 @@ class BuildFromTaskPlan:
     def _produces(self, t: TaskSpec) -> List[dict]:
         try:
             raw = t.outputs.get("produces") if isinstance(t.outputs, dict) else []
+            if not isinstance(raw, list):
+                raw = [] if raw is None else [raw]
+            refs = []
+            for r in raw:
+                nr = self._normalize_artifact_ref(r)
+                if isinstance(nr, dict):
+                    refs.append(nr)
+            return refs
+        except Exception:
+            return []
+
+    def _consumes(self, t: TaskSpec) -> List[dict]:
+        """Return normalized artifact refs declared in task inputs.consumes.
+
+        Shape is language-neutral: a list of objects with at least {"id": str}.
+        """
+        try:
+            raw = t.inputs.get("consumes") if isinstance(t.inputs, dict) else []
             if not isinstance(raw, list):
                 raw = [] if raw is None else [raw]
             refs = []
@@ -114,7 +170,11 @@ class BuildFromTaskPlan:
                 try:
                     jdata = json.loads(raw)
                 except Exception:
-                    if p.suffix.lower() == ".json" or str(kind).lower() in {"json", "openapi", "schema"}:
+                    if p.suffix.lower() == ".json" or str(kind).lower() in {
+                        "json",
+                        "openapi",
+                        "schema",
+                    }:
                         try:
                             with p.open("r", encoding="utf-8") as fh:
                                 jdata = json.load(fh)
@@ -162,7 +222,7 @@ class BuildFromTaskPlan:
             prev_sigs[fname] = sig
         functions = prev_sigs
 
-        # Build node-scoped context from CodeSpec only (Spec-first, language-agnostic)
+        # Build node-scoped context (Spec-first, language-agnostic) and include deterministic ContextPack.
         c_ext = dict(self.constraints or {})
         c_ext.setdefault("side_context", {})
         cs_file = self._file_specs_by_path.get(fpath)
@@ -182,9 +242,59 @@ class BuildFromTaskPlan:
             classes_meta = dict(getattr(cs_file, "classes", {}) or {})
             constants_meta = dict(getattr(cs_file, "constants", {}) or {})
             content_meta = getattr(cs_file, "content", None)
-        c_ext["side_context"].update({
-            "codespec_file": cs_raw or {},
-        })
+        c_ext["side_context"].update(
+            {
+                "codespec_file": cs_raw or {},
+            }
+        )
+
+        # Optional: include per-node ledger + compiled context pack to improve generation quality.
+        try:
+            if self.ledger_store is not None and self.context_compiler is not None:
+                tid = str(getattr(t, "id", None) or meta.get("name") or fpath)
+                led = self.ledger_store.load(tid)
+                # Include existing file content as bounded snippet when present.
+                existing_text = ""
+                existing_path = self.paths.outputs / fpath
+                if existing_path.exists():
+                    try:
+                        existing_text = existing_path.read_text(encoding="utf-8")
+                    except Exception:
+                        existing_text = ""
+                pack = self.context_compiler.compile(
+                    idea=self.idea or "",
+                    constraints=c_ext,
+                    node=t.model_dump(exclude_none=True),
+                    parent=None,
+                    siblings=[],
+                    ledger=led,
+                    artifacts=self.registry.list(),
+                    files={fpath: existing_text} if existing_text else {},
+                    file_specs=cs_raw or {},
+                    signals={},
+                )
+                c_ext["side_context"].update(
+                    {
+                        "context_pack": pack,
+                    }
+                )
+                # Record provenance
+                try:
+                    led.context_pack_digests.append(str(pack.get("digest") or ""))
+                    self.ledger_store.save(led)
+                except Exception:
+                    pass
+        except Exception as e:
+            # Do not proceed without the authoritative context_pack in strict/side_context calls.
+            try:
+                sc_err = c_ext.get("side_context")
+                if not isinstance(sc_err, dict):
+                    sc_err = {}
+                    c_ext["side_context"] = sc_err
+                sc_err["context_pack_error"] = {"type": type(e).__name__, "message": str(e)}
+            except Exception:
+                pass
+            raise
 
         file_text = self.engine.generate_full_file(
             idea=self.idea or "",
@@ -203,17 +313,32 @@ class BuildFromTaskPlan:
             content=content_meta,
         )
         out_file = self.paths.outputs / fpath
-        write_code_file(out_file, file_text)
+        write_text_locked(out_file, file_text)
+
+        # Fail fast: verify that the generated file contains declared exports.
+        # This is language-agnostic (DSPy-based) and prevents "island" leaves.
+        try:
+            exp_eff = list(exports or [])
+            if entry and entry not in exp_eff:
+                exp_eff.append(str(entry))
+            v = self.engine.verify_exports_in_text(
+                file=fpath,
+                language=str(lang_eff or ""),
+                exports=exp_eff,
+                text=str(file_text or ""),
+            )
+            if not bool(v.get("ok", False)):
+                missing = v.get("missing", [])
+                return False, f"missing_exports:{missing}", {"path": fpath, "language": lang_eff}
+        except Exception as e:
+            return False, f"export_verify_error:{e}", {"path": fpath, "language": lang_eff}
 
         # Trace chunk for provenance
         chunks_dir = self.paths.artifacts / "chunks"
-        ensure_parent(chunks_dir / "_.txt")
-        cstem = f"{Path(fpath).stem}_{fname}_{hashlib.sha1((str(sig) or fname).encode('utf-8')).hexdigest()[:10]}"
+        chunks_dir.mkdir(parents=True, exist_ok=True)
+        cstem = f"{Path(fpath).stem}_{fname}_{hashlib.sha1((str(sig) or fname).encode('utf-8')).hexdigest()}"
         cfile = chunks_dir / f"{cstem}.txt"
-        # Lock chunk file to avoid interleaved writes across concurrent builders
-        lock_path = cfile.parent / (cfile.name + ".lock")
-        with lock_file(lock_path):
-            cfile.write_text(file_text, encoding="utf-8")
+        write_text_locked(cfile, file_text)
 
         # Update CodeSpec with generated file information
         self._update_codespec_file(fpath, lang_eff, exports, imports, entry, functions)
@@ -242,14 +367,80 @@ class BuildFromTaskPlan:
                 fixed.append(r)
             self.registry.register(fixed, base_dir=self.paths.outputs)
             for r in fixed:
-                self._validate_artifact_ref(r)
+                ok_art, rep_art = self._validate_artifact_ref(r)
+                if not ok_art:
+                    # Artifact contracts are part of correctness; fail the leaf.
+                    return False, "artifact_validation_failed", {
+                        "path": fpath,
+                        "language": lang_eff,
+                        "artifact": str((r or {}).get("id") or ""),
+                        "issues": ";".join([str(x) for x in (rep_art.get("issues") or [])])
+                        if isinstance(rep_art, dict)
+                        else "",
+                    }
+
+            # Persist produced artifacts into the node ledger (for coverage/evidence).
+            try:
+                if self.ledger_store is not None:
+                    tid = str(getattr(t, "id", None) or meta.get("name") or fpath)
+                    led = self.ledger_store.load(tid)
+                    led.produced_artifacts = list(led.produced_artifacts or [])
+                    for r in fixed:
+                        led.produced_artifacts.append(dict(r))
+
+                    # If this leaf succeeded, update obligation-derived TODOs.
+                    # Node-scope obligations can be marked done here; project-scope stays open
+                    # until higher-level (project/composite) validation discharges it.
+                    try:
+                        node_dict = t.model_dump(exclude_none=True)
+                        obs = extract_obligations_from_node(node=node_dict, inherited_deps=[])
+                        # Keep structured obligations for provenance.
+                        led.obligation_items = list(led.obligation_items or [])
+                        by_id = {
+                            str(o.get("id") or ""): o
+                            for o in (led.obligation_items or [])
+                            if isinstance(o, dict)
+                        }
+                        for o in obs:
+                            by_id[o.id] = o.to_dict()
+                        led.obligation_items = list(by_id.values())
+
+                        todo_by_id = {str(ti.id): ti for ti in (led.todos or [])}
+                        for o in obs:
+                            todo_id = stable_todo_id_from_obligation(o.id)
+                            target_status = "done" if str(o.scope or "") == "node" else "open"
+                            if todo_id in todo_by_id:
+                                # Do not override an already-done TODO, but do allow promotion to done for node scope.
+                                if target_status == "done" and str(todo_by_id[todo_id].status or "") != "done":
+                                    todo_by_id[todo_id].status = "done"
+                                if not str(todo_by_id[todo_id].text or "").strip():
+                                    todo_by_id[todo_id].text = format_structured_todo_text(obligation=o)
+                            else:
+                                led.todos.append(
+                                    TodoItem(
+                                        id=todo_id,
+                                        text=format_structured_todo_text(obligation=o),
+                                        status=target_status,
+                                    )
+                                )
+                    except Exception:
+                        pass
+
+                    self.ledger_store.save(led)
+            except Exception:
+                pass
 
         return True, "ok", {"path": fpath, "language": lang_eff}
 
-        
-    def _update_codespec_file(self, path: str, language: str, exports: List[str], 
-                             imports: List[str], entrypoint: Optional[str], 
-                             functions: Dict[str, str]) -> None:
+    def _update_codespec_file(
+        self,
+        path: str,
+        language: str,
+        exports: List[str],
+        imports: List[str],
+        entrypoint: Optional[str],
+        functions: Dict[str, str],
+    ) -> None:
         """Update CodeSpec file with generated information."""
         if path in self._file_specs_by_path:
             # Update existing file spec
@@ -262,7 +453,7 @@ class BuildFromTaskPlan:
                 file_spec.imports = imports
             if entrypoint:
                 file_spec.entrypoint = entrypoint
-            
+
             # Update functions with signatures
             if functions:
                 if not file_spec.functions:
@@ -270,7 +461,7 @@ class BuildFromTaskPlan:
                 for name, signature in functions.items():
                     if name not in file_spec.functions:
                         file_spec.functions[name] = {}
-                    file_spec.functions[name]['signature'] = signature
+                    file_spec.functions[name]["signature"] = signature
         else:
             # Create new file spec
             file_spec = CodeSpecFile(
@@ -279,59 +470,113 @@ class BuildFromTaskPlan:
                 imports=imports,
                 exports=exports,
                 entrypoint=entrypoint,
-                functions={name: {'signature': sig} for name, sig in functions.items()}
+                functions={name: {"signature": sig} for name, sig in functions.items()},
             )
             self.codespec.files.append(file_spec)
             self._file_specs_by_path[path] = file_spec
-            
+
     def save_codespec(self) -> None:
         """Save the progressive CodeSpec to file."""
         codespec_path = self.paths.plan / "codespec.json"
         ensure_parent(codespec_path)
-        
+
         # Convert to dict for JSON serialization
-        codespec_dict = {
-            'files': []
-        }
-        
+        codespec_dict = {"files": []}
+
         for file_spec in self.codespec.files:
             file_dict = {
-                'path': file_spec.path,
-                'purpose': file_spec.purpose or '',
-                'language': file_spec.language,
-                'imports': file_spec.imports or [],
-                'exports': file_spec.exports or [],
-                'functions': file_spec.functions or {},
-                'classes': file_spec.classes or {},
-                'constants': file_spec.constants or {},
-                'entrypoint': file_spec.entrypoint,
-                'content': file_spec.content or '',
-                'description': file_spec.description or '',
-                'exports_detail': file_spec.exports_detail or []
+                "path": file_spec.path,
+                "purpose": file_spec.purpose or "",
+                "language": file_spec.language,
+                "imports": file_spec.imports or [],
+                "exports": file_spec.exports or [],
+                "functions": file_spec.functions or {},
+                "classes": file_spec.classes or {},
+                "constants": file_spec.constants or {},
+                "entrypoint": file_spec.entrypoint,
+                "content": file_spec.content or "",
+                "description": file_spec.description or "",
+                "exports_detail": file_spec.exports_detail or [],
             }
-            codespec_dict['files'].append(file_dict)
-        
+            codespec_dict["files"].append(file_dict)
+
         atomic_write_json(codespec_path, codespec_dict)
 
 
 @app.callback(invoke_without_command=True)
 def main(
-    idea: Annotated[Optional[str], typer.Option("--idea", help="Idea; if omitted uses run/plan/idea.json or unified_plan.json")] = None,
-    constraints: Annotated[Optional[str], typer.Option("--constraints", help="Optional JSON string of constraints to steer splitting/implementation")] = None,
+    idea: Annotated[
+        Optional[str],
+        typer.Option(
+            "--idea", help="Idea; if omitted uses run/plan/idea.json or unified_plan.json"
+        ),
+    ] = None,
+    constraints: Annotated[
+        Optional[str],
+        typer.Option(
+            "--constraints",
+            help="Optional JSON string of constraints to steer splitting/implementation",
+        ),
+    ] = None,
     run_dir: Annotated[Optional[str], typer.Option("--run-dir", help="Base runs folder")] = None,
     run: Annotated[str, typer.Option("--run", help="run_<ts> | latest | new | name")] = "new",
-    model: Annotated[Optional[str], typer.Option("--model", help="Override model for LLM steps")] = None,
-    max_children: Annotated[int, typer.Option("--max-children", min=1, help="Max concurrent child tasks the scheduler will select")] = 2,
-    node_id: Annotated[Optional[str], typer.Option("--node-id", help="Deterministic node id for this executor")] = None,
-    parent_id: Annotated[Optional[str], typer.Option("--parent-id", help="Parent node id for orchestration tracking")] = None,
-    lease_ttl: Annotated[int, typer.Option("--lease-ttl", min=30, help="TTL seconds for executor lease")] = 180,
-    child_ttl: Annotated[int, typer.Option("--child-ttl", min=30, help="TTL seconds for child leases")] = 120,
-    keep_going: Annotated[bool, typer.Option("--keep-going/--fail-fast", help="On task failures, continue other tasks instead of aborting")] = True,
-    allow_amend: Annotated[bool, typer.Option("--amend/--no-amend", help="Allow dynamic LLM-driven plan amendments when progress stalls")] = True,
-    amend_max_rounds: Annotated[int, typer.Option("--amend-rounds", min=0, help="Max amendment rounds when blocked")] = 3,
-    require_artifact_valid: Annotated[bool, typer.Option("--require-artifact-valid/--allow-unknown-artifact", help="Gate tasks on consumed artifacts being validated OK")] = True,
-    max_iters: Annotated[int, typer.Option("--max-iters", min=1, help="Max scheduler loop iterations before aborting")] = 10000,
-    max_seconds: Annotated[Optional[int], typer.Option("--max-seconds", min=1, help="Optional wall-clock timeout in seconds (fail when exceeded)")] = None,
+    model: Annotated[
+        Optional[str], typer.Option("--model", help="Override model for LLM steps")
+    ] = None,
+    max_children: Annotated[
+        int,
+        typer.Option(
+            "--max-children", min=1, help="Max concurrent child tasks the scheduler will select"
+        ),
+    ] = 2,
+    node_id: Annotated[
+        Optional[str], typer.Option("--node-id", help="Deterministic node id for this executor")
+    ] = None,
+    parent_id: Annotated[
+        Optional[str], typer.Option("--parent-id", help="Parent node id for orchestration tracking")
+    ] = None,
+    lease_ttl: Annotated[
+        int, typer.Option("--lease-ttl", min=30, help="TTL seconds for executor lease")
+    ] = 180,
+    child_ttl: Annotated[
+        int, typer.Option("--child-ttl", min=30, help="TTL seconds for child leases")
+    ] = 120,
+    keep_going: Annotated[
+        bool,
+        typer.Option(
+            "--keep-going/--fail-fast",
+            help="On task failures, continue other tasks instead of aborting",
+        ),
+    ] = True,
+    allow_amend: Annotated[
+        bool,
+        typer.Option(
+            "--amend/--no-amend",
+            help="Allow dynamic LLM-driven plan amendments when progress stalls",
+        ),
+    ] = True,
+    amend_max_rounds: Annotated[
+        int, typer.Option("--amend-rounds", min=0, help="Max amendment rounds when blocked")
+    ] = 3,
+    require_artifact_valid: Annotated[
+        bool,
+        typer.Option(
+            "--require-artifact-valid/--allow-unknown-artifact",
+            help="Gate tasks on consumed artifacts being validated OK",
+        ),
+    ] = True,
+    max_iters: Annotated[
+        int,
+        typer.Option("--max-iters", min=1, help="Max scheduler loop iterations before aborting"),
+    ] = 10000,
+    max_seconds: Annotated[
+        Optional[int],
+        typer.Option(
+            "--max-seconds",
+            min=1,
+            help="Optional wall-clock timeout in seconds (fail when exceeded)",
+        ),
+    ] = None,
 ):
     base = Path(run_dir) if run_dir else None
     run_path = resolve_run_dir(base, run)
@@ -344,12 +589,16 @@ def main(
     # Fail fast if provider-specific requirements are not satisfied (no hardcoding)
     sel = load_selection()
     if not sel:
-        console.print("[red]No LLM selection found.[/red] Use `python -m crpb llm choose` to select a provider and model before running tasks.")
+        console.print(
+            "[red]No LLM selection found.[/red] Set CRPB_LLM_PROVIDER in .env (recommended) or use `python -m crpb llm choose` to select a provider and model before running tasks."
+        )
         raise typer.Exit(code=2)
     ok, missing = require_env_vars(sel)
     if not ok:
         miss = ", ".join(missing)
-        console.print(f"[red]LLM configuration incomplete for tasks: provider={sel.provider} missing: {miss}[/red]")
+        console.print(
+            f"[red]LLM configuration incomplete for tasks: provider={sel.provider} missing: {miss}[/red]"
+        )
         raise typer.Exit(code=2)
 
     # Constraints load
@@ -366,7 +615,13 @@ def main(
             try:
                 constraints_obj = json.loads(cfile.read_text(encoding="utf-8"))
             except Exception as e:
-                bus.emit("CONSTRAINTS_PARSE_ERROR", node_id="tasks", file=str(cfile), error=str(e), parent_id=parent_id)
+                bus.emit(
+                    "CONSTRAINTS_PARSE_ERROR",
+                    node_id="tasks",
+                    file=str(cfile),
+                    error=str(e),
+                    parent_id=parent_id,
+                )
                 constraints_obj = {}
 
     # Idea resolution
@@ -376,7 +631,13 @@ def main(
             try:
                 idea = json.loads(idea_file.read_text(encoding="utf-8")).get("idea", "")
             except Exception as e:
-                bus.emit("IDEA_PARSE_FAILED", node_id="tasks", file=str(idea_file), error=str(e), parent_id=parent_id)
+                bus.emit(
+                    "IDEA_PARSE_FAILED",
+                    node_id="tasks",
+                    file=str(idea_file),
+                    error=str(e),
+                    parent_id=parent_id,
+                )
                 idea = ""
         else:
             idea = ""
@@ -388,6 +649,9 @@ def main(
     engine = DspyEngine(model=model)
     # Initialize Artifact Registry
     registry = ArtifactRegistry(paths.artifacts / "index.json")
+    # Run-scoped persistent node memory + deterministic context packing
+    ledger_store = NodeLedgerStore(base_dir=paths.artifacts)
+    context_compiler = ContextCompiler()
 
     # Wall-clock timeout tracking
     start_wall = time.time()
@@ -400,17 +664,31 @@ def main(
 
     taskplan_refine_max_rounds = 2
     try:
-        env_val = int(os.environ.get("CRPB_TASKPLAN_REFINE_MAX_ROUNDS", str(taskplan_refine_max_rounds)))
+        env_val = int(
+            os.environ.get("CRPB_TASKPLAN_REFINE_MAX_ROUNDS", str(taskplan_refine_max_rounds))
+        )
         taskplan_refine_max_rounds = _clamp(env_val)
     except Exception as e:
-        bus.emit("ENV_PARSE_INVALID", node_id=node_id, var="CRPB_TASKPLAN_REFINE_MAX_ROUNDS", error=str(e), parent_id=parent_id)
+        bus.emit(
+            "ENV_PARSE_INVALID",
+            node_id=node_id,
+            var="CRPB_TASKPLAN_REFINE_MAX_ROUNDS",
+            error=str(e),
+            parent_id=parent_id,
+        )
         taskplan_refine_max_rounds = _clamp(taskplan_refine_max_rounds)
     if isinstance(constraints_obj, dict):
         try:
             mr = int(constraints_obj.get("taskplan_refine_max_rounds", taskplan_refine_max_rounds))
             taskplan_refine_max_rounds = _clamp(mr)
         except Exception as e:
-            bus.emit("CONSTRAINTS_PARSE_INVALID", node_id=node_id, field="taskplan_refine_max_rounds", error=str(e), parent_id=parent_id)
+            bus.emit(
+                "CONSTRAINTS_PARSE_INVALID",
+                node_id=node_id,
+                field="taskplan_refine_max_rounds",
+                error=str(e),
+                parent_id=parent_id,
+            )
             taskplan_refine_max_rounds = _clamp(taskplan_refine_max_rounds)
 
     # Deterministic defaults
@@ -425,22 +703,40 @@ def main(
     # Load TaskPlan from plan directory (prefer plan.json; fallback to legacy task_plan.json)
     plan_path = paths.plan / "plan.json"
     legacy_task_plan_path = paths.plan / "task_plan.json"
+    task_plan_path = plan_path  # use plan.json as primary save location
     if plan_path.exists():
         try:
             tp_obj = json.loads(plan_path.read_text(encoding="utf-8"))
             tp = TaskPlan.model_validate(tp_obj)
         except Exception as e:
             console.print(f"[red]Failed to load plan.json: {e}[/red]")
-            bus.emit("PLAN_READ_FAILED", node_id=node_id, file=str(plan_path), error=str(e), parent_id=parent_id)
+            bus.emit(
+                "PLAN_READ_FAILED",
+                node_id=node_id,
+                file=str(plan_path),
+                error=str(e),
+                parent_id=parent_id,
+            )
             raise typer.Exit(code=2)
     elif legacy_task_plan_path.exists():
         try:
             tp_obj = json.loads(legacy_task_plan_path.read_text(encoding="utf-8"))
             tp = TaskPlan.model_validate(tp_obj)
-            bus.emit("PLAN_LEGACY_USED", node_id=node_id, file=str(legacy_task_plan_path), parent_id=parent_id)
+            bus.emit(
+                "PLAN_LEGACY_USED",
+                node_id=node_id,
+                file=str(legacy_task_plan_path),
+                parent_id=parent_id,
+            )
         except Exception as e:
             console.print(f"[red]Failed to load task_plan.json: {e}[/red]")
-            bus.emit("PLAN_LEGACY_READ_FAILED", node_id=node_id, file=str(legacy_task_plan_path), error=str(e), parent_id=parent_id)
+            bus.emit(
+                "PLAN_LEGACY_READ_FAILED",
+                node_id=node_id,
+                file=str(legacy_task_plan_path),
+                error=str(e),
+                parent_id=parent_id,
+            )
             raise typer.Exit(code=2)
     else:
         if not idea:
@@ -454,7 +750,25 @@ def main(
     try:
         atomic_write_json(plan_path, tp.model_dump(exclude_none=True))
     except Exception as e:
-        bus.emit("PLAN_WRITE_FAILED", node_id=node_id, file=str(plan_path), error=str(e), parent_id=parent_id)
+        bus.emit(
+            "PLAN_WRITE_FAILED",
+            node_id=node_id,
+            file=str(plan_path),
+            error=str(e),
+            parent_id=parent_id,
+        )
+
+    rep = validate_taskplan_general(tp)
+    if not rep.get("ok", False):
+        issues = rep.get("issues", [])
+        console.print(f"[red]TaskPlan validation failed:[/red] {', '.join(issues)}")
+        bus.emit(
+            "PLAN_VALIDATION_ABORT",
+            node_id=node_id,
+            issues=issues,
+            parent_id=parent_id,
+        )
+        raise typer.Exit(code=2)
 
     # Orchestration state
     # Index all tasks to avoid repeated flattening
@@ -466,7 +780,7 @@ def main(
     all_tasks: Dict[str, TaskSpec] = {}
     _index(tp.tasks, all_tasks)
 
-    statuses: Dict[str, str] = {tid: "pending" for tid in list(all_tasks.keys())}
+    statuses: Dict[str, str] = dict.fromkeys(list(all_tasks.keys()), "pending")
     deps_map: Dict[str, List[str]] = {tid: list(t.deps) for tid, t in all_tasks.items()}
     parents: Dict[str, str | None] = {}
 
@@ -477,8 +791,18 @@ def main(
 
     set_parents(tp.tasks)
 
+    def _register_subtree(ts: List[TaskSpec], parent: str | None) -> None:
+        for t in ts:
+            tid = getattr(t, "id", None)
+            if not isinstance(tid, str) or not tid:
+                continue
+            statuses.setdefault(tid, "pending")
+            deps_map[tid] = list(getattr(t, "deps", []) or [])
+            parents[tid] = parent
+            _register_subtree(list(getattr(t, "children", []) or []), tid)
+
     chunks_dir = paths.artifacts / "chunks"
-    ensure_parent(chunks_dir / "dummy.txt")
+    chunks_dir.mkdir(parents=True, exist_ok=True)
 
     # File metadata cache for code leaves (language-agnostic)
     file_meta_by_path: Dict[str, Dict] = {}
@@ -492,8 +816,10 @@ def main(
         constraints=constraints_obj,
         file_meta_by_path=file_meta_by_path,
         codespec=CodeSpec(),
+        ledger_store=ledger_store,
+        context_compiler=context_compiler,
     )
-    
+
     # Seed CodeSpec from plan/codespec.json when present (Spec-first)
     try:
         cs_path = paths.plan / "codespec.json"
@@ -520,7 +846,9 @@ def main(
                             fns[k.strip()] = dict(v)
                 # Normalize classes/constants as dicts
                 cls = dict(f.get("classes") or {}) if isinstance(f.get("classes"), dict) else {}
-                consts = dict(f.get("constants") or {}) if isinstance(f.get("constants"), dict) else {}
+                consts = (
+                    dict(f.get("constants") or {}) if isinstance(f.get("constants"), dict) else {}
+                )
                 # Normalize exports_detail to list of dicts
                 ed = f.get("exports_detail") or []
                 exports_detail: List[Dict[str, Any]] = []
@@ -547,7 +875,13 @@ def main(
                 adapter.codespec = CodeSpec(files=seeded)
     except Exception as e:
         # Non-fatal: continue without initial CodeSpec but record diagnostic
-        bus.emit("CODESPEC_SEED_FAILED", node_id=node_id, file=str(paths.plan / "codespec.json"), error=str(e), parent_id=parent_id)
+        bus.emit(
+            "CODESPEC_SEED_FAILED",
+            node_id=node_id,
+            file=str(paths.plan / "codespec.json"),
+            error=str(e),
+            parent_id=parent_id,
+        )
 
     # Artifact validation helpers (Phase 4)
     def _validate_artifact_ref(ref: dict) -> Tuple[bool, dict]:
@@ -568,7 +902,11 @@ def main(
                     jdata = json.loads(raw)
                 except Exception:
                     # If suffix/kind strongly indicate JSON, try json.load as double-check
-                    if p.suffix.lower() == ".json" or str(kind).lower() in {"json", "openapi", "schema"}:
+                    if p.suffix.lower() == ".json" or str(kind).lower() in {
+                        "json",
+                        "openapi",
+                        "schema",
+                    }:
                         try:
                             with p.open("r", encoding="utf-8") as fh:
                                 jdata = json.load(fh)
@@ -595,7 +933,9 @@ def main(
                     registry.set_validation_for_path(p, ok=ok, report=result)
             return ok, result
         except Exception as e:
-            bus.emit("VALIDATOR_ERROR", node_id=node_id, error=str(e), ref=str(ref), parent_id=parent_id)
+            bus.emit(
+                "VALIDATOR_ERROR", node_id=node_id, error=str(e), ref=str(ref), parent_id=parent_id
+            )
             return False, {"ok": False, "issues": [f"validator_error: {e}"]}
 
     def _ensure_consumes_ready(consumes: List[dict]) -> bool:
@@ -621,10 +961,13 @@ def main(
             if (
                 statuses.get(tid) == "pending"
                 and all(statuses.get(d) == "done" for d in deps_map.get(tid, []))
-                and (not t.children or all(statuses.get(getattr(c, "id", None)) == "done" for c in t.children))
+                and (
+                    not t.children
+                    or all(statuses.get(getattr(c, "id", None)) == "done" for c in t.children)
+                )
             ):
                 # Artifact gating: all consumed artifacts must exist
-                consumes = _consumes(t)
+                consumes = adapter._consumes(t)
                 if consumes and not _ensure_consumes_ready(consumes):
                     # gated; skip until artifacts available and valid
                     continue
@@ -650,10 +993,12 @@ def main(
             if any(statuses.get(d) != "done" for d in deps_map.get(tid, [])):
                 totals["deps_blocked"] += 1
             # children waiting
-            if t.children and any(statuses.get(getattr(c, "id", None)) != "done" for c in t.children):
+            if t.children and any(
+                statuses.get(getattr(c, "id", None)) != "done" for c in t.children
+            ):
                 totals["children_waiting"] += 1
             # artifact gating (cheap check; do not validate here)
-            cons = _consumes(t)
+            cons = adapter._consumes(t)
             if cons:
                 gated = False
                 for r in cons:
@@ -667,7 +1012,13 @@ def main(
                                 gated = True
                                 break
                     except Exception as e:
-                        bus.emit("ARTIFACT_GATE_CHECK_FAILED", node_id=node_id, ref=str(r), error=str(e), parent_id=parent_id)
+                        bus.emit(
+                            "ARTIFACT_GATE_CHECK_FAILED",
+                            node_id=node_id,
+                            ref=str(r),
+                            error=str(e),
+                            parent_id=parent_id,
+                        )
                         gated = True
                         break
                 if gated:
@@ -687,9 +1038,12 @@ def main(
         decided_split = False
         new_children: List[TaskSpec] = []
         try:
-            obj = engine.decide_split(task=task.model_dump(exclude_none=True), idea=idea, constraints=constraints_obj)
+            obj = engine.decide_split(
+                task=task.model_dump(exclude_none=True), idea=idea, constraints=constraints_obj
+            )
             action = obj.get("action", "implement")
             if action == "split":
+
                 def build_t(td: dict) -> TaskSpec:
                     return TaskSpec(
                         id=td.get("id"),
@@ -701,6 +1055,7 @@ def main(
                         outputs=td.get("outputs", {}),
                         children=[build_t(c) for c in td.get("children", [])],
                     )
+
                 new_children = [build_t(x) for x in obj.get("children", [])]
                 decided_split = True
         except Exception as e:
@@ -719,7 +1074,9 @@ def main(
                 constraints=constraints_obj,
             )
         except Exception as e:
-            bus.emit("AMEND_ENGINE_FAILED", node_id=node_id, error=str(e), parent_id=parent_id)
+            bus.emit(
+                "AMEND_ENGINE_FAILED", node_id=node_id, error=str(e), parent_id=parent_id
+            )
             return 0
         edits = edits_obj.get("edits", []) if isinstance(edits_obj, dict) else []
         applied = 0
@@ -744,18 +1101,17 @@ def main(
                 continue
             op = ed.get("op")
             if op == "add_child":
-                parent_id = ed.get("parent_id")
+                ed_parent_id = ed.get("parent_id")
                 td = ed.get("task") or {}
-                parent = find_task(parent_id) if isinstance(parent_id, str) else None
+                parent = find_task(ed_parent_id) if isinstance(ed_parent_id, str) else None
                 if parent is None:
                     continue
                 child = build_task(td)
                 parent.children.append(child)
-                _normalize_ids(parent.children)
+                # Ensure new ids do not collide with global task ids
+                _normalize_ids(parent.children, existing_index=all_tasks)
                 _index([child], all_tasks)
-                statuses[child.id] = "pending"  # type: ignore[index]
-                deps_map[child.id] = list(child.deps)  # type: ignore[index]
-                parents[child.id] = parent.id  # type: ignore[index]
+                _register_subtree([child], parent.id)
                 applied += 1
             elif op == "update_task":
                 tid = ed.get("id")
@@ -803,6 +1159,7 @@ def main(
 
     def _subtree_files(task: TaskSpec) -> List[str]:
         acc: set[str] = set()
+
         def walk(t: TaskSpec):
             if t.kind == "code:function":
                 p = t.inputs.get("path") if isinstance(t.inputs, dict) else None
@@ -810,6 +1167,7 @@ def main(
                     acc.add(p)
             for c in t.children:
                 walk(c)
+
         walk(task)
         return sorted(acc)
 
@@ -822,7 +1180,13 @@ def main(
                 try:
                     fm[fp] = out.read_text(encoding="utf-8")
                 except Exception as e:
-                    bus.emit("READ_OUTPUT_FAILED", node_id=node_id, file=fp, error=str(e), parent_id=parent_id)
+                    bus.emit(
+                        "READ_OUTPUT_FAILED",
+                        node_id=node_id,
+                        file=fp,
+                        error=str(e),
+                        parent_id=parent_id,
+                    )
                     fm[fp] = ""
         return fm
 
@@ -835,22 +1199,26 @@ def main(
             if cs_path.exists():
                 cs_obj = json.loads(cs_path.read_text(encoding="utf-8"))
                 files = []
-                for item in (cs_obj.get("files", []) or []):
+                for item in cs_obj.get("files", []) or []:
                     if not isinstance(item, dict):
                         continue
                     p = item.get("path")
                     if isinstance(p, str) and p.strip():
-                        files.append({
-                            "path": p,
-                            "language": item.get("language"),
-                            "exports": item.get("exports", []),
-                            "imports": item.get("imports", []),
-                            "entrypoint": item.get("entrypoint"),
-                            "functions": item.get("functions", {}),
-                        })
+                        files.append(
+                            {
+                                "path": p,
+                                "language": item.get("language"),
+                                "exports": item.get("exports", []),
+                                "imports": item.get("imports", []),
+                                "entrypoint": item.get("entrypoint"),
+                                "functions": item.get("functions", {}),
+                            }
+                        )
                 return {"modules": [{"name": "codespec", "files": files}]}
         except Exception as e:
-            bus.emit("CODESPEC_COMPAT_PLAN_FAILED", node_id=node_id, error=str(e), parent_id=parent_id)
+            bus.emit(
+                "CODESPEC_COMPAT_PLAN_FAILED", node_id=node_id, error=str(e), parent_id=parent_id
+            )
         return {}
 
     def _collect_file_specs(plan_obj: dict, files: List[str]) -> Dict[str, dict]:
@@ -869,7 +1237,9 @@ def main(
                             "functions": f.get("functions", {}),
                         }
         except Exception as e:
-            bus.emit("FILE_SPECS_COLLECT_FAILED", node_id=node_id, error=str(e), parent_id=parent_id)
+            bus.emit(
+                "FILE_SPECS_COLLECT_FAILED", node_id=node_id, error=str(e), parent_id=parent_id
+            )
         return specs
 
     def _project_validate_gate(task: TaskSpec) -> Tuple[bool, str]:
@@ -879,16 +1249,94 @@ def main(
         plan_obj = _load_plan_obj()
         fspecs = _collect_file_specs(plan_obj, list(fmap.keys()))
         try:
-            report = engine.project_validate(
-                idea=idea or "",
-                constraints=constraints_obj,
-                plan=plan_obj,
-                files=fmap,
-                file_specs=fspecs,
-            )
+            def _compute_report() -> Tuple[Dict[str, Any], Dict[str, Any]]:
+                # Multi-pass validation over whole files.
+                # We never truncate file text; we instead validate in bounded chunks.
+                cur_fmap = fmap
+                try:
+                    max_pv_chars = int(os.environ.get("CRPB_PROJECT_VALIDATE_MAX_CHARS", "60000"))
+                except Exception:
+                    max_pv_chars = 60000
+                try:
+                    max_pv_files = int(os.environ.get("CRPB_PROJECT_VALIDATE_MAX_FILES", "20"))
+                except Exception:
+                    max_pv_files = 20
+
+                all_paths = sorted(cur_fmap.keys())
+                chunks: List[Dict[str, str]] = []
+                cur: Dict[str, str] = {}
+                total = 0
+                for p in all_paths:
+                    txt = cur_fmap.get(p) or ""
+                    if cur and (
+                        len(cur) >= int(max_pv_files)
+                        or (total + len(txt)) > int(max_pv_chars)
+                    ):
+                        chunks.append(cur)
+                        cur = {}
+                        total = 0
+                    cur[p] = txt
+                    total += len(txt)
+                    if len(cur) >= int(max_pv_files) or total >= int(max_pv_chars):
+                        chunks.append(cur)
+                        cur = {}
+                        total = 0
+                if cur:
+                    chunks.append(cur)
+
+                merged: Dict[str, Any] = {
+                    "ok": True,
+                    "issues": [],
+                    "warnings": [],
+                    "suggestions": [],
+                }
+
+                # LLM-only validation over whole files (no deterministic validators).
+
+                for ch in chunks:
+                    sub_specs = {p: fspecs.get(p, {}) for p in ch.keys()}
+                    rep = engine.project_validate(
+                        idea=idea or "",
+                        constraints=constraints_obj,
+                        plan=plan_obj,
+                        files=ch,
+                        file_specs=sub_specs,
+                    )
+                    if not isinstance(rep, dict):
+                        merged["ok"] = False
+                        merged["issues"].append("validator_error:invalid_project_validate_output")
+                        continue
+                    if not bool(rep.get("ok", False)):
+                        merged["ok"] = False
+                    for k in ("issues", "warnings", "suggestions"):
+                        vals = rep.get(k) or []
+                        if isinstance(vals, list):
+                            merged[k].extend([str(x) for x in vals])
+
+                # Dedupe while preserving order
+                for k in ("issues", "warnings", "suggestions"):
+                    seen: set[str] = set()
+                    out: List[str] = []
+                    for x in merged.get(k) or []:
+                        sx = str(x)
+                        if sx not in seen:
+                            seen.add(sx)
+                            out.append(sx)
+                    merged[k] = out
+
+                return merged, {}
+
+            # Multi-pass validation over whole files.
+            # We never truncate file text; we instead validate in bounded chunks.
+            report, _det = _compute_report()
         except Exception as e:
             bus.emit("PROJECT_VALIDATE_ERROR", node_id=node_id, error=str(e), parent_id=parent_id)
-            report = {"ok": False, "issues": [f"validator_error:{e}"], "warnings": [], "suggestions": []}
+            report = {
+                "ok": False,
+                "issues": [f"validator_error:{e}"],
+                "warnings": [],
+                "suggestions": [],
+            }
         # Persist report per-task
         rep_path = paths.validations / f"project_validation_{getattr(task, 'id', 'unknown')}.json"
         ensure_parent(rep_path)
@@ -904,11 +1352,29 @@ def main(
             parent_id=parent_id,
         )
         if not ok:
+            try:
+                max_msg = int(os.environ.get("CRPB_EVENT_MAX_MESSAGE_CHARS", "800"))
+            except Exception:
+                max_msg = 800
+
+            msg_payload: Dict[str, Any] = {"message": msg, "message_len": len(str(msg))}
+            if max_msg > 0 and len(str(msg)) > max_msg:
+                ref = externalize_text(
+                    base_dir=paths.artifacts,
+                    category="messages",
+                    text=str(msg),
+                    ext=".txt",
+                )
+                msg_payload = {
+                    "message": f"externalized:{ref.get('sha1')}",
+                    "message_len": ref.get("len"),
+                    "message_ref": ref,
+                }
             bus.emit(
                 "VALIDATION_FAILED",
                 node_id=node_id,
                 kind="project",
-                message=msg[:500],
+                **msg_payload,
                 task_id=getattr(task, "id", None),
                 parent_id=parent_id,
             )
@@ -929,9 +1395,11 @@ def main(
             entry = meta.get("entrypoint")
             if entry and entry not in exports:
                 exports = exports + [entry]
-            language = meta.get("language") or infer_language_from_path(fpath) or ""
+            language = meta.get("language") or ""
             text = out_file.read_text(encoding="utf-8")
-            v = engine.verify_exports_in_text(file=fpath, language=str(language or ""), exports=exports, text=text)
+            v = engine.verify_exports_in_text(
+                file=fpath, language=str(language or ""), exports=exports, text=text
+            )
             if not v.get("ok", False):
                 missing = v.get("missing", [])
                 return False, f"missing_exports: {missing}"
@@ -948,13 +1416,32 @@ def main(
             break
         iters += 1
         progressed = False
-        tick_started = time.perf_counter()
+        time.perf_counter()
         # renew lease heartbeat
         try:
             leases.renew(node_id, lease_id, ttl=lease_ttl)
         except Exception as e:
-            bus.emit("LEASE_RENEW_FAILED", node_id=node_id, lease_id=lease_id, error=str(e), parent_id=parent_id)
+            bus.emit(
+                "LEASE_RENEW_FAILED",
+                node_id=node_id,
+                lease_id=lease_id,
+                error=str(e),
+                parent_id=parent_id,
+            )
         rtasks = ready_tasks()
+
+        ready_ids = [getattr(t, "id", None) for t in rtasks]
+        sample_limit = 5
+        sample_ids: List[Any] = []
+        for i, rid in enumerate(ready_ids):
+            if i >= sample_limit:
+                break
+            sample_ids.append(rid)
+        omitted = max(0, len(ready_ids) - len(sample_ids))
+        try:
+            max_list_items = int(os.environ.get("CRPB_EVENT_MAX_LIST_ITEMS", "200"))
+        except Exception:
+            max_list_items = 200
         # loop tick + ready set metrics
         pending_ct = sum(1 for s in statuses.values() if s == "pending")
         running_ct = sum(1 for s in statuses.values() if s == "running")
@@ -972,12 +1459,30 @@ def main(
             elapsed=int(time.time() - start_wall),
             parent_id=parent_id,
         )
+        ready_payload: Dict[str, Any] = {
+            "sample": sample_ids,
+            "sample_limit": sample_limit,
+            "omitted": omitted,
+        }
+        if max_list_items > 0 and len(ready_ids) <= max_list_items:
+            ready_payload["ready_ids"] = ready_ids
+            ready_payload["ready_ids_inlined"] = True
+        else:
+            ready_payload["ready_ids_inlined"] = False
+            if ready_ids:
+                ready_payload["ready_ids_ref"] = externalize_json(
+                    base_dir=paths.artifacts,
+                    category="lists",
+                    obj=ready_ids,
+                    ext=".json",
+                )
+
         bus.emit(
             "READY_SET",
             node_id=node_id,
             count=len(rtasks),
-            sample=[getattr(t, "id", None) for t in rtasks[:5]],
             parent_id=parent_id,
+            **ready_payload,
         )
         if not rtasks:
             # attempt amend if allowed and pending tasks remain
@@ -994,17 +1499,31 @@ def main(
                 )
                 total_applied = 0
                 while rounds < amend_max_rounds:
-                    bus.emit("AMEND_ATTEMPT", node_id=node_id, parent_id=parent_id, round=rounds + 1)
+                    bus.emit(
+                        "AMEND_ATTEMPT", node_id=node_id, parent_id=parent_id, round=rounds + 1
+                    )
                     made = amend_once()
                     if made:
                         total_applied += int(made)
-                        bus.emit("AMEND_APPLIED", node_id=node_id, parent_id=parent_id, round=rounds + 1, edits=made)
+                        bus.emit(
+                            "AMEND_APPLIED",
+                            node_id=node_id,
+                            parent_id=parent_id,
+                            round=rounds + 1,
+                            edits=made,
+                        )
                         progressed = True
                         rtasks = ready_tasks()
                         if rtasks:
                             break
                     rounds += 1
-                bus.emit("AMEND_RESULT", node_id=node_id, parent_id=parent_id, rounds=rounds, total_applied=total_applied)
+                bus.emit(
+                    "AMEND_RESULT",
+                    node_id=node_id,
+                    parent_id=parent_id,
+                    rounds=rounds,
+                    total_applied=total_applied,
+                )
                 if not rtasks:
                     break
             else:
@@ -1018,8 +1537,24 @@ def main(
                     amend_limit=0,
                 )
                 break
-        # limit to max_children
-        rtasks = rtasks[:max_children]
+        # limit to max_children (do not slice silently; record the limit)
+        if isinstance(max_children, int) and max_children > 0 and len(rtasks) > max_children:
+            total_ready = len(rtasks)
+            limited: List[TaskSpec] = []
+            for i, t in enumerate(rtasks):
+                if i >= max_children:
+                    break
+                limited.append(t)
+            rtasks = limited
+            bus.emit(
+                "READY_LIMIT_APPLIED",
+                node_id=node_id,
+                parent_id=parent_id,
+                max_children=max_children,
+                ready_total=total_ready,
+                ready_selected=len(rtasks),
+                ready_omitted=max(0, total_ready - len(rtasks)),
+            )
 
         for t in rtasks:
             tid = t.id  # type: ignore[assignment]
@@ -1027,10 +1562,26 @@ def main(
             child_exec_id = f"task::{tid}"
             status.write(child_exec_id, "CREATED", parent_id=node_id)
             tlease = leases.grant(child_exec_id, ttl=child_ttl)
-            status.write(child_exec_id, "LEASED", prev_state="CREATED", lease_id=tlease, parent_id=node_id)
-            bus.emit("TASK_ASSIGNED", parent=node_id, child=child_exec_id, task_id=tid, kind=t.kind, parent_id=parent_id)
+            status.write(
+                child_exec_id, "LEASED", prev_state="CREATED", lease_id=tlease, parent_id=node_id
+            )
+            bus.emit(
+                "TASK_ASSIGNED",
+                parent=node_id,
+                child=child_exec_id,
+                task_id=tid,
+                kind=t.kind,
+                parent_id=parent_id,
+            )
             # alias for watchers expecting CHILD_* events
-            bus.emit("CHILD_ASSIGNED", parent=node_id, child=child_exec_id, task_id=tid, kind=t.kind, parent_id=parent_id)
+            bus.emit(
+                "CHILD_ASSIGNED",
+                parent=node_id,
+                child=child_exec_id,
+                task_id=tid,
+                kind=t.kind,
+                parent_id=parent_id,
+            )
 
             # Clarify tasks at every level using DSPy with a bounded refine loop.
             # Parent provides context; siblings provide boundaries.
@@ -1039,7 +1590,9 @@ def main(
                 last_clarified: Dict | None = None
                 clarify_start = time.perf_counter()
                 clarify_changed_any = False
-                prev_snapshot = json.dumps(t.model_dump(exclude_none=True), sort_keys=True, separators=(",", ":"))
+                prev_snapshot = json.dumps(
+                    t.model_dump(exclude_none=True), sort_keys=True, separators=(",", ":")
+                )
                 while rounds < taskplan_refine_max_rounds:
                     rounds += 1
                     p_id = parents.get(tid)
@@ -1051,14 +1604,65 @@ def main(
                                 siblings_specs.append(s)
                     touched = _subtree_files(p_task) if p_task is not None else _subtree_files(t)
                     fmap = _files_map(paths, touched)
+
+                    # Compile deterministic context for this node (budgeted) and persist node ledger.
+                    try:
+                        led = ledger_store.load(
+                            tid, parent_id=str(p_id) if isinstance(p_id, str) else None
+                        )
+                    except Exception:
+                        led = None
+
+                    constraints_for_call: Dict[str, Any] = dict(constraints_obj or {})
+                    sc = constraints_for_call.get("side_context")
+                    if not isinstance(sc, dict):
+                        sc = {}
+                    # Attach side_context before compiling so ContextCompiler uses strict mode
+                    # (no silent truncation) for LLM-bound calls.
+                    constraints_for_call["side_context"] = sc
+                    try:
+                        pack = context_compiler.compile(
+                            idea=idea or "",
+                            constraints=constraints_for_call,
+                            node=t.model_dump(exclude_none=True),
+                            parent=(
+                                p_task.model_dump(exclude_none=True) if p_task is not None else None
+                            ),
+                            siblings=[s.model_dump(exclude_none=True) for s in siblings_specs],
+                            ledger=led,
+                            artifacts=registry.list(),
+                            files=fmap,
+                            file_specs={},
+                            signals={},
+                        )
+                        sc["context_pack"] = pack
+                        if led is not None:
+                            try:
+                                led.context_pack_digests.append(str(pack.get("digest") or ""))
+                                ledger_store.save(led)
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        sc["context_pack_error"] = {
+                            "type": type(e).__name__,
+                            "message": str(e),
+                        }
+                        raise
+                    # Ensure side_context is present even if pack compilation failed.
+                    constraints_for_call["side_context"] = sc
+
                     clarified = engine.clarify_task(
                         task=t.model_dump(exclude_none=True),
-                        parent=(p_task.model_dump(exclude_none=True) if p_task is not None else None),
+                        parent=(
+                            p_task.model_dump(exclude_none=True) if p_task is not None else None
+                        ),
                         siblings=[s.model_dump(exclude_none=True) for s in siblings_specs],
                         artifacts=registry.list(),
-                        files=fmap,
+                        # Never pass large raw file maps into LLM calls.
+                        # File context is carried via constraints.side_context.context_pack.
+                        files={},
                         idea=idea or "",
-                        constraints=constraints_obj,
+                        constraints=constraints_for_call,
                     )
                     last_clarified = clarified if isinstance(clarified, dict) else None
                     if isinstance(clarified, dict):
@@ -1066,6 +1670,10 @@ def main(
                         for key in ["kind", "title", "description"]:
                             if key in clarified:
                                 setattr(t, key, clarified[key])
+                        if "node_plan" in clarified and isinstance(clarified["node_plan"], dict):
+                            t.node_plan = dict(clarified["node_plan"])  # type: ignore[assignment]
+                        if "meta" in clarified and isinstance(clarified["meta"], dict):
+                            t.meta = dict(clarified["meta"])  # type: ignore[assignment]
                         if "deps" in clarified and isinstance(clarified["deps"], list):
                             t.deps = list(clarified["deps"])  # type: ignore[assignment]
                             deps_map[tid] = list(t.deps)
@@ -1073,7 +1681,44 @@ def main(
                             t.inputs = dict(clarified["inputs"])  # type: ignore[assignment]
                         if "outputs" in clarified and isinstance(clarified["outputs"], dict):
                             t.outputs = dict(clarified["outputs"])  # type: ignore[assignment]
-                    cur_snapshot = json.dumps(t.model_dump(exclude_none=True), sort_keys=True, separators=(",", ":"))
+
+                    # Best-effort ledger sync from node_plan.
+                    try:
+                        if led is not None and isinstance(getattr(t, "node_plan", None), dict):
+                            node_dict = t.model_dump(exclude_none=True)
+                            obligations = extract_obligations_from_node(
+                                node=node_dict, inherited_deps=[]
+                            )
+                            # Persist structured obligations for provenance.
+                            led.obligation_items = list(led.obligation_items or [])
+                            by_id = {
+                                str(o.get("id") or ""): o
+                                for o in (led.obligation_items or [])
+                                if isinstance(o, dict)
+                            }
+                            for o in obligations:
+                                by_id[o.id] = o.to_dict()
+                            led.obligation_items = list(by_id.values())
+
+                            # Ensure stable TODOs exist for each obligation.
+                            existing_todos = {str(ti.id): ti for ti in (led.todos or [])}
+                            for o in obligations:
+                                tid = stable_todo_id_from_obligation(o.id)
+                                if tid in existing_todos:
+                                    continue
+                                led.todos.append(
+                                    TodoItem(
+                                        id=tid,
+                                        text=format_structured_todo_text(obligation=o),
+                                    )
+                                )
+
+                            ledger_store.save(led)
+                    except Exception:
+                        pass
+                    cur_snapshot = json.dumps(
+                        t.model_dump(exclude_none=True), sort_keys=True, separators=(",", ":")
+                    )
                     if cur_snapshot == prev_snapshot:
                         break
                     prev_snapshot = cur_snapshot
@@ -1082,9 +1727,17 @@ def main(
                 if last_clarified is not None:
                     atomic_write_json(task_plan_path, tp.model_dump(exclude_none=True))
                     elab_dir = paths.validations / "tasks" / "elaborations"
-                    ensure_parent(elab_dir / "_.json")
-                    (elab_dir / f"{tid}.json").write_text(json.dumps(last_clarified, indent=2), encoding="utf-8")
-                    bus.emit("TASK_CLARIFIED", parent=node_id, child=child_exec_id, task_id=tid, parent_id=parent_id)
+                    elab_dir.mkdir(parents=True, exist_ok=True)
+                    (elab_dir / f"{tid}.json").write_text(
+                        json.dumps(last_clarified, indent=2), encoding="utf-8"
+                    )
+                    bus.emit(
+                        "TASK_CLARIFIED",
+                        parent=node_id,
+                        child=child_exec_id,
+                        task_id=tid,
+                        parent_id=parent_id,
+                    )
                 bus.emit(
                     "TASK_CLARIFY_SUMMARY",
                     parent=node_id,
@@ -1097,7 +1750,14 @@ def main(
                 )
             except Exception as _e:
                 # Non-fatal: proceed without clarification but log
-                bus.emit("TASK_CLARIFY_FAILED", parent=node_id, child=child_exec_id, task_id=tid, error=str(_e), parent_id=parent_id)
+                bus.emit(
+                    "TASK_CLARIFY_FAILED",
+                    parent=node_id,
+                    child=child_exec_id,
+                    task_id=tid,
+                    error=str(_e),
+                    parent_id=parent_id,
+                )
 
             # Decide split vs implement
             sd_start = time.perf_counter()
@@ -1116,7 +1776,8 @@ def main(
                 # Attach only truly new children and normalize ids
                 pre_ids = {getattr(c, "id", None) for c in t.children}
                 t.children.extend(children)
-                _normalize_ids(t.children)
+                # Ensure new ids do not collide with global task ids
+                _normalize_ids(t.children, existing_index=all_tasks)
                 # deduplicate by id while preserving order
                 seen: set[str | None] = set()
                 deduped: List[TaskSpec] = []
@@ -1135,78 +1796,180 @@ def main(
                         last_child_clarified: Dict | None = None
                         c_clarify_start = time.perf_counter()
                         c_changed_any = False
-                        prev_snapshot = json.dumps(c.model_dump(exclude_none=True), sort_keys=True, separators=(",", ":"))
+                        prev_snapshot = json.dumps(
+                            c.model_dump(exclude_none=True), sort_keys=True, separators=(",", ":")
+                        )
                         while rounds < taskplan_refine_max_rounds:
                             rounds += 1
-                            siblings_specs = [s for s in t.children if getattr(s, "id", None) != getattr(c, "id", None)]
+                            siblings_specs = [
+                                s
+                                for s in t.children
+                                if getattr(s, "id", None) != getattr(c, "id", None)
+                            ]
                             fmap = _files_map(paths, _subtree_files(t))
+                            # Build a strict context_pack for this child clarification.
+                            child_constraints: Dict[str, Any] = dict(constraints_obj or {})
+                            sc2 = child_constraints.get("side_context")
+                            if not isinstance(sc2, dict):
+                                sc2 = {}
+                            child_constraints["side_context"] = sc2
+                            try:
+                                led2 = None
+                                try:
+                                    led2 = ledger_store.load(
+                                        str(getattr(c, "id", None) or ""),
+                                        parent_id=str(getattr(t, "id", None) or ""),
+                                    )
+                                except Exception:
+                                    led2 = None
+                                pack2 = context_compiler.compile(
+                                    idea=idea or "",
+                                    constraints=child_constraints,
+                                    node=c.model_dump(exclude_none=True),
+                                    parent=t.model_dump(exclude_none=True),
+                                    siblings=[s.model_dump(exclude_none=True) for s in siblings_specs],
+                                    ledger=led2,
+                                    artifacts=registry.list(),
+                                    files=fmap,
+                                    file_specs={},
+                                    signals={},
+                                )
+                                sc2["context_pack"] = pack2
+                            except Exception as e:
+                                sc2["context_pack_error"] = {
+                                    "type": type(e).__name__,
+                                    "message": str(e),
+                                }
+                                raise
+                            child_constraints["side_context"] = sc2
+
                             clarified_child = engine.clarify_task(
                                 task=c.model_dump(exclude_none=True),
                                 parent=t.model_dump(exclude_none=True),
                                 siblings=[s.model_dump(exclude_none=True) for s in siblings_specs],
                                 artifacts=registry.list(),
-                                files=fmap,
+                                files={},
                                 idea=idea or "",
-                                constraints=constraints_obj,
+                                constraints=child_constraints,
                             )
-                            last_child_clarified = clarified_child if isinstance(clarified_child, dict) else None
+                            last_child_clarified = (
+                                clarified_child if isinstance(clarified_child, dict) else None
+                            )
                             if isinstance(clarified_child, dict):
                                 # apply safe fields
                                 for key in ["kind", "title", "description"]:
                                     if key in clarified_child:
                                         setattr(c, key, clarified_child[key])
-                                if "deps" in clarified_child and isinstance(clarified_child["deps"], list):
+                                if "deps" in clarified_child and isinstance(
+                                    clarified_child["deps"], list
+                                ):
                                     c.deps = list(clarified_child["deps"])  # type: ignore[assignment]
-                                if "inputs" in clarified_child and isinstance(clarified_child["inputs"], dict):
+                                if "inputs" in clarified_child and isinstance(
+                                    clarified_child["inputs"], dict
+                                ):
                                     c.inputs = dict(clarified_child["inputs"])  # type: ignore[assignment]
-                                if "outputs" in clarified_child and isinstance(clarified_child["outputs"], dict):
+                                if "outputs" in clarified_child and isinstance(
+                                    clarified_child["outputs"], dict
+                                ):
                                     c.outputs = dict(clarified_child["outputs"])  # type: ignore[assignment]
-                            cur_snapshot = json.dumps(c.model_dump(exclude_none=True), sort_keys=True, separators=(",", ":"))
+                            cur_snapshot = json.dumps(
+                                c.model_dump(exclude_none=True),
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            )
                             if cur_snapshot == prev_snapshot:
                                 break
                             prev_snapshot = cur_snapshot
                             c_changed_any = True
-                    # Persist once after loop and emit event for the child
-                    if last_child_clarified is not None:
-                        atomic_write_json(task_plan_path, tp.model_dump(exclude_none=True))
-                        elab_dir = paths.validations / "tasks" / "elaborations"
-                        ensure_parent(elab_dir / "_.json")
-                        (elab_dir / f"{getattr(c, 'id', 'child')}.json").write_text(json.dumps(last_child_clarified, indent=2), encoding="utf-8")
-                    bus.emit(
-                        "TASK_CHILD_CLARIFY_SUMMARY",
-                        parent=node_id,
-                        child=child_exec_id,
-                        task_id=getattr(c, "id", None),
-                        rounds=rounds,
-                        changed=c_changed_any,
-                        duration_ms=int((time.perf_counter() - c_clarify_start) * 1000),
-                        parent_id=parent_id,
-                    )
-                except Exception as _e:
-                    # Non-fatal: proceed without clarification but log
-                    bus.emit("TASK_CHILD_CLARIFY_FAILED", parent=node_id, child=child_exec_id, task_id=getattr(c, "id", None), error=str(_e), parent_id=parent_id)
+                        # Persist once after loop and emit event for the child
+                        if last_child_clarified is not None:
+                            atomic_write_json(task_plan_path, tp.model_dump(exclude_none=True))
+                            elab_dir = paths.validations / "tasks" / "elaborations"
+                            elab_dir.mkdir(parents=True, exist_ok=True)
+                            (elab_dir / f"{getattr(c, 'id', 'child')}.json").write_text(
+                                json.dumps(last_child_clarified, indent=2), encoding="utf-8"
+                            )
+                        bus.emit(
+                            "TASK_CHILD_CLARIFY_SUMMARY",
+                            parent=node_id,
+                            child=child_exec_id,
+                            task_id=getattr(c, "id", None),
+                            rounds=rounds,
+                            changed=c_changed_any,
+                            duration_ms=int((time.perf_counter() - c_clarify_start) * 1000),
+                            parent_id=parent_id,
+                        )
+                    except Exception as _e:
+                        # Non-fatal: proceed without clarification but log
+                        bus.emit(
+                            "TASK_CHILD_CLARIFY_FAILED",
+                            parent=node_id,
+                            child=child_exec_id,
+                            task_id=getattr(c, "id", None),
+                            error=str(_e),
+                            parent_id=parent_id,
+                        )
                 # index newly added subtree
                 _index(new_children, all_tasks)
                 # Update deps/status maps
-                for c in new_children:
-                    statuses[c.id] = "pending"  # type: ignore[index]
-                    deps_map[c.id] = list(c.deps)  # type: ignore[index]
-                    parents[c.id] = tid  # type: ignore[index]
+                _register_subtree(new_children, tid)
                 # Persist updated plan
                 atomic_write_json(task_plan_path, tp.model_dump(exclude_none=True))
                 status.write(child_exec_id, "DONE", prev_state="LEASED", parent_id=node_id)
                 added_count = len(new_children)
-                bus.emit("TASK_SPLIT", parent=node_id, child=child_exec_id, task_id=tid, added=added_count, parent_id=parent_id)
-                bus.emit("CHILD_SPLIT", parent=node_id, child=child_exec_id, task_id=tid, added=added_count, parent_id=parent_id)
+                bus.emit(
+                    "TASK_SPLIT",
+                    parent=node_id,
+                    child=child_exec_id,
+                    task_id=tid,
+                    added=added_count,
+                    parent_id=parent_id,
+                )
+                bus.emit(
+                    "CHILD_SPLIT",
+                    parent=node_id,
+                    child=child_exec_id,
+                    task_id=tid,
+                    added=added_count,
+                    parent_id=parent_id,
+                )
                 # Guard against no-op split decisions
                 if added_count == 0:
                     reason = "no_op_split: decision returned no new actionable children"
                     statuses[tid] = "failed"
-                    status.write(child_exec_id, "FAILED", prev_state="LEASED", parent_id=node_id, reason=reason)
-                    bus.emit("TASK_FAILED", parent=node_id, child=child_exec_id, task_id=tid, kind=t.kind, reason=reason, parent_id=parent_id)
-                    bus.emit("CHILD_FAILED", parent=node_id, child=child_exec_id, task_id=tid, kind=t.kind, reason=reason, parent_id=parent_id)
+                    status.write(
+                        child_exec_id,
+                        "FAILED",
+                        prev_state="LEASED",
+                        parent_id=node_id,
+                        reason=reason,
+                    )
+                    bus.emit(
+                        "TASK_FAILED",
+                        parent=node_id,
+                        child=child_exec_id,
+                        task_id=tid,
+                        kind=t.kind,
+                        reason=reason,
+                        parent_id=parent_id,
+                    )
+                    bus.emit(
+                        "CHILD_FAILED",
+                        parent=node_id,
+                        child=child_exec_id,
+                        task_id=tid,
+                        kind=t.kind,
+                        reason=reason,
+                        parent_id=parent_id,
+                    )
                     if not keep_going:
-                        status.write(node_id, "FAILED_FINAL", prev_state="LEASED", reason=reason, parent_id=parent_id)
+                        status.write(
+                            node_id,
+                            "FAILED_FINAL",
+                            prev_state="LEASED",
+                            reason=reason,
+                            parent_id=parent_id,
+                        )
                         bus.emit("NODE_FAILED", node_id=node_id, reason=reason, parent_id=parent_id)
                         raise typer.Exit(code=1)
                     # continue scheduling other tasks
@@ -1229,11 +1992,38 @@ def main(
                     try:
                         adapter.save_codespec()
                     except Exception as e:
-                        bus.emit("CODESPEC_SAVE_FAILED", node_id=node_id, file=str(paths.plan / "codespec.json"), error=str(e), parent_id=parent_id)
+                        bus.emit(
+                            "CODESPEC_SAVE_FAILED",
+                            node_id=node_id,
+                            file=str(paths.plan / "codespec.json"),
+                            error=str(e),
+                            parent_id=parent_id,
+                        )
                     status.write(child_exec_id, "DONE", prev_state="LEASED", parent_id=node_id)
-                    bus.emit("FILE_GENERATED", parent=node_id, child=child_exec_id, path=fpath, language=(lang_eff or ""), parent_id=parent_id)
-                    bus.emit("TASK_DONE", parent=node_id, child=child_exec_id, task_id=tid, kind=t.kind, parent_id=parent_id)
-                    bus.emit("CHILD_DONE", parent=node_id, child=child_exec_id, task_id=tid, kind=t.kind, parent_id=parent_id)
+                    bus.emit(
+                        "FILE_GENERATED",
+                        parent=node_id,
+                        child=child_exec_id,
+                        path=fpath,
+                        language=(lang_eff or ""),
+                        parent_id=parent_id,
+                    )
+                    bus.emit(
+                        "TASK_DONE",
+                        parent=node_id,
+                        child=child_exec_id,
+                        task_id=tid,
+                        kind=t.kind,
+                        parent_id=parent_id,
+                    )
+                    bus.emit(
+                        "CHILD_DONE",
+                        parent=node_id,
+                        child=child_exec_id,
+                        task_id=tid,
+                        kind=t.kind,
+                        parent_id=parent_id,
+                    )
                     statuses[tid] = "done"
                 elif t.kind == "composite":
                     # If leaf-composite (no children), mark done. Otherwise, children are all done (due to readiness),
@@ -1242,12 +2032,42 @@ def main(
                         # Enforce strict parent discipline: composite tasks must delegate; they cannot self-complete
                         reason = "composite_leaf_forbidden: parent must delegate by splitting; cannot mark done"
                         statuses[tid] = "failed"
-                        status.write(child_exec_id, "FAILED", prev_state="LEASED", parent_id=node_id, reason=reason)
-                        bus.emit("TASK_FAILED", parent=node_id, child=child_exec_id, task_id=tid, kind=t.kind, reason=reason, parent_id=parent_id)
-                        bus.emit("CHILD_FAILED", parent=node_id, child=child_exec_id, task_id=tid, kind=t.kind, reason=reason, parent_id=parent_id)
+                        status.write(
+                            child_exec_id,
+                            "FAILED",
+                            prev_state="LEASED",
+                            parent_id=node_id,
+                            reason=reason,
+                        )
+                        bus.emit(
+                            "TASK_FAILED",
+                            parent=node_id,
+                            child=child_exec_id,
+                            task_id=tid,
+                            kind=t.kind,
+                            reason=reason,
+                            parent_id=parent_id,
+                        )
+                        bus.emit(
+                            "CHILD_FAILED",
+                            parent=node_id,
+                            child=child_exec_id,
+                            task_id=tid,
+                            kind=t.kind,
+                            reason=reason,
+                            parent_id=parent_id,
+                        )
                         if not keep_going:
-                            status.write(node_id, "FAILED_FINAL", prev_state="LEASED", reason=reason, parent_id=parent_id)
-                            bus.emit("NODE_FAILED", node_id=node_id, reason=reason, parent_id=parent_id)
+                            status.write(
+                                node_id,
+                                "FAILED_FINAL",
+                                prev_state="LEASED",
+                                reason=reason,
+                                parent_id=parent_id,
+                            )
+                            bus.emit(
+                                "NODE_FAILED", node_id=node_id, reason=reason, parent_id=parent_id
+                            )
                             raise typer.Exit(code=1)
                     else:
                         # Merge children's outputs into parent-level artifacts/files using DSPy (language-agnostic)
@@ -1256,23 +2076,49 @@ def main(
                             children_payload = [c.model_dump(exclude_none=True) for c in t.children]
                             touched = _subtree_files(t)
                             fmap = _files_map(paths, touched)
+                            merge_constraints: Dict[str, Any] = dict(constraints_obj or {})
+                            scm = merge_constraints.get("side_context")
+                            if not isinstance(scm, dict):
+                                scm = {}
+                            merge_constraints["side_context"] = scm
+                            try:
+                                packm = context_compiler.compile(
+                                    idea=idea or "",
+                                    constraints=merge_constraints,
+                                    node=parent_payload,
+                                    parent=None,
+                                    siblings=children_payload,
+                                    ledger=None,
+                                    artifacts=registry.list(),
+                                    files=fmap,
+                                    file_specs={},
+                                    signals={},
+                                )
+                                scm["context_pack"] = packm
+                            except Exception as e:
+                                scm["context_pack_error"] = {
+                                    "type": type(e).__name__,
+                                    "message": str(e),
+                                }
+                                raise
+                            merge_constraints["side_context"] = scm
                             merge_plan = engine.merge_subtasks(
                                 parent=parent_payload,
                                 children=children_payload,
                                 artifacts=registry.list(),
-                                files=fmap,
+                                files={},
                                 idea=idea or "",
-                                constraints=constraints_obj,
+                                constraints=merge_constraints,
                             )
                             if isinstance(merge_plan, dict):
                                 # Apply writes
-                                for w in (merge_plan.get("writes") or []):
+                                for w in merge_plan.get("writes") or []:
                                     if isinstance(w, dict):
                                         wpath = w.get("path")
                                         wtext = w.get("text", "")
                                         if isinstance(wpath, str):
                                             out_path = paths.outputs / wpath
-                                            write_code_file(out_path, str(wtext))
+                                            write_text_locked(out_path, str(wtext))
                                 # Register artifacts
                                 marts = merge_plan.get("artifacts") or []
                                 if isinstance(marts, list) and marts:
@@ -1280,30 +2126,98 @@ def main(
                                     for r in marts:
                                         if isinstance(r, dict):
                                             _validate_artifact_ref(r)
-                                bus.emit("TASK_MERGED", parent=node_id, child=child_exec_id, task_id=tid, parent_id=parent_id)
-                        except Exception as _e:
-                            # Non-fatal: continue to review; failures will surface there if critical
-                            pass
+                                bus.emit(
+                                    "TASK_MERGED",
+                                    parent=node_id,
+                                    child=child_exec_id,
+                                    task_id=tid,
+                                    parent_id=parent_id,
+                                )
+                        except Exception as e:
+                            bus.emit(
+                                "MERGE_SUBTASKS_FAILED",
+                                parent=node_id,
+                                child=child_exec_id,
+                                task_id=tid,
+                                error=str(e),
+                                parent_id=parent_id,
+                            )
+                            raise
                         ok, reason = _review_composite(t)
                         if ok:
                             # Gate composite completion on project-level validation for its subtree
                             pv_ok, pv_msg = _project_validate_gate(t)
                             if not pv_ok:
                                 statuses[tid] = "failed"
-                                status.write(child_exec_id, "FAILED", prev_state="LEASED", parent_id=node_id, reason=pv_msg)
-                                bus.emit("TASK_FAILED", parent=node_id, child=child_exec_id, task_id=tid, kind=t.kind, reason=pv_msg, parent_id=parent_id)
-                                bus.emit("CHILD_FAILED", parent=node_id, child=child_exec_id, task_id=tid, kind=t.kind, reason=pv_msg, parent_id=parent_id)
+                                status.write(
+                                    child_exec_id,
+                                    "FAILED",
+                                    prev_state="LEASED",
+                                    parent_id=node_id,
+                                    reason=pv_msg,
+                                )
+                                bus.emit(
+                                    "TASK_FAILED",
+                                    parent=node_id,
+                                    child=child_exec_id,
+                                    task_id=tid,
+                                    kind=t.kind,
+                                    reason=pv_msg,
+                                    parent_id=parent_id,
+                                )
+                                bus.emit(
+                                    "CHILD_FAILED",
+                                    parent=node_id,
+                                    child=child_exec_id,
+                                    task_id=tid,
+                                    kind=t.kind,
+                                    reason=pv_msg,
+                                    parent_id=parent_id,
+                                )
                                 if not keep_going:
-                                    status.write(node_id, "FAILED_FINAL", prev_state="LEASED", reason=pv_msg, parent_id=parent_id)
-                                    bus.emit("NODE_FAILED", node_id=node_id, reason=pv_msg, parent_id=parent_id)
+                                    status.write(
+                                        node_id,
+                                        "FAILED_FINAL",
+                                        prev_state="LEASED",
+                                        reason=pv_msg,
+                                        parent_id=parent_id,
+                                    )
+                                    bus.emit(
+                                        "NODE_FAILED",
+                                        node_id=node_id,
+                                        reason=pv_msg,
+                                        parent_id=parent_id,
+                                    )
                                     raise typer.Exit(code=1)
                                 continue
-                            status.write(child_exec_id, "DONE", prev_state="LEASED", parent_id=node_id)
-                            bus.emit("COMPOSITE_REVIEW_PASSED", parent=node_id, child=child_exec_id, task_id=tid, parent_id=parent_id)
-                            bus.emit("TASK_DONE", parent=node_id, child=child_exec_id, task_id=tid, kind=t.kind, parent_id=parent_id)
-                            bus.emit("CHILD_DONE", parent=node_id, child=child_exec_id, task_id=tid, kind=t.kind, parent_id=parent_id)
+                            status.write(
+                                child_exec_id, "DONE", prev_state="LEASED", parent_id=node_id
+                            )
+                            bus.emit(
+                                "COMPOSITE_REVIEW_PASSED",
+                                parent=node_id,
+                                child=child_exec_id,
+                                task_id=tid,
+                                parent_id=parent_id,
+                            )
+                            bus.emit(
+                                "TASK_DONE",
+                                parent=node_id,
+                                child=child_exec_id,
+                                task_id=tid,
+                                kind=t.kind,
+                                parent_id=parent_id,
+                            )
+                            bus.emit(
+                                "CHILD_DONE",
+                                parent=node_id,
+                                child=child_exec_id,
+                                task_id=tid,
+                                kind=t.kind,
+                                parent_id=parent_id,
+                            )
                             # Register any declared produced artifacts at the composite boundary and validate
-                            prods = _produces(t)
+                            prods = adapter._produces(t)
                             if prods:
                                 registry.register(prods, base_dir=paths.outputs)
                                 for r in prods:
@@ -1311,27 +2225,87 @@ def main(
                             statuses[tid] = "done"
                         else:
                             statuses[tid] = "failed"
-                            status.write(child_exec_id, "FAILED", prev_state="LEASED", parent_id=node_id, reason=reason)
-                            bus.emit("COMPOSITE_REVIEW_FAILED", parent=node_id, child=child_exec_id, task_id=tid, reason=reason, parent_id=parent_id)
-                            bus.emit("TASK_FAILED", parent=node_id, child=child_exec_id, task_id=tid, kind=t.kind, reason=reason, parent_id=parent_id)
-                            bus.emit("CHILD_FAILED", parent=node_id, child=child_exec_id, task_id=tid, kind=t.kind, reason=reason, parent_id=parent_id)
+                            status.write(
+                                child_exec_id,
+                                "FAILED",
+                                prev_state="LEASED",
+                                parent_id=node_id,
+                                reason=reason,
+                            )
+                            bus.emit(
+                                "COMPOSITE_REVIEW_FAILED",
+                                parent=node_id,
+                                child=child_exec_id,
+                                task_id=tid,
+                                reason=reason,
+                                parent_id=parent_id,
+                            )
+                            bus.emit(
+                                "TASK_FAILED",
+                                parent=node_id,
+                                child=child_exec_id,
+                                task_id=tid,
+                                kind=t.kind,
+                                reason=reason,
+                                parent_id=parent_id,
+                            )
+                            bus.emit(
+                                "CHILD_FAILED",
+                                parent=node_id,
+                                child=child_exec_id,
+                                task_id=tid,
+                                kind=t.kind,
+                                reason=reason,
+                                parent_id=parent_id,
+                            )
                             if not keep_going:
-                                status.write(node_id, "FAILED_FINAL", prev_state="LEASED", reason=reason, parent_id=parent_id)
-                                bus.emit("NODE_FAILED", node_id=node_id, reason=reason, parent_id=parent_id)
+                                status.write(
+                                    node_id,
+                                    "FAILED_FINAL",
+                                    prev_state="LEASED",
+                                    reason=reason,
+                                    parent_id=parent_id,
+                                )
+                                bus.emit(
+                                    "NODE_FAILED",
+                                    node_id=node_id,
+                                    reason=reason,
+                                    parent_id=parent_id,
+                                )
                                 raise typer.Exit(code=1)
                 else:
-                    # Unknown kinds: mark as done (extensible via future workers)
-                    status.write(child_exec_id, "DONE", prev_state="LEASED", parent_id=node_id)
-                    bus.emit("TASK_DONE", parent=node_id, child=child_exec_id, task_id=tid, kind=t.kind, parent_id=parent_id)
-                    bus.emit("CHILD_DONE", parent=node_id, child=child_exec_id, task_id=tid, kind=t.kind, parent_id=parent_id)
-                    statuses[tid] = "done"
+                    raise ValueError(f"unknown_kind_no_worker:{t.kind}")
             except Exception as e:
                 statuses[tid] = "failed"
-                status.write(child_exec_id, "FAILED", prev_state="LEASED", parent_id=node_id, reason=str(e))
-                bus.emit("TASK_FAILED", parent=node_id, child=child_exec_id, task_id=tid, kind=t.kind, reason=str(e), parent_id=parent_id)
-                bus.emit("CHILD_FAILED", parent=node_id, child=child_exec_id, task_id=tid, kind=t.kind, reason=str(e), parent_id=parent_id)
+                status.write(
+                    child_exec_id, "FAILED", prev_state="LEASED", parent_id=node_id, reason=str(e)
+                )
+                bus.emit(
+                    "TASK_FAILED",
+                    parent=node_id,
+                    child=child_exec_id,
+                    task_id=tid,
+                    kind=t.kind,
+                    reason=str(e),
+                    parent_id=parent_id,
+                )
+                bus.emit(
+                    "CHILD_FAILED",
+                    parent=node_id,
+                    child=child_exec_id,
+                    task_id=tid,
+                    kind=t.kind,
+                    reason=str(e),
+                    parent_id=parent_id,
+                )
                 if not keep_going:
-                    status.write(node_id, "FAILED_FINAL", prev_state="LEASED", reason=str(e), parent_id=parent_id)
+                    status.write(
+                        node_id,
+                        "FAILED_FINAL",
+                        prev_state="LEASED",
+                        reason=str(e),
+                        parent_id=parent_id,
+                    )
                     bus.emit("NODE_FAILED", node_id=node_id, reason=str(e), parent_id=parent_id)
                     raise typer.Exit(code=1)
 
@@ -1340,30 +2314,58 @@ def main(
             try:
                 leases.renew(node_id, lease_id, ttl=lease_ttl)
             except Exception as e:
-                bus.emit("LEASE_RENEW_FAILED", node_id=node_id, lease_id=lease_id, error=str(e), parent_id=parent_id)
+                bus.emit(
+                    "LEASE_RENEW_FAILED",
+                    node_id=node_id,
+                    lease_id=lease_id,
+                    error=str(e),
+                    parent_id=parent_id,
+                )
 
     # Enforce wall-clock timeout after loop
     if timed_out:
         reason = f"wall_clock_timeout:{max_seconds}s"
-        status.write(node_id, "FAILED_FINAL", prev_state="LEASED", reason=reason, parent_id=parent_id)
+        status.write(
+            node_id, "FAILED_FINAL", prev_state="LEASED", reason=reason, parent_id=parent_id
+        )
         bus.emit("NODE_FAILED", node_id=node_id, reason=reason, parent_id=parent_id)
         raise typer.Exit(code=1)
 
     # After tasks, check if any pending remain
     remaining = [tid for tid, st in statuses.items() if st not in ("done",)]
     if remaining:
-        console.print(f"[yellow]Tasks left pending or blocked[/yellow]: {remaining[:10]} ...")
+        if len(remaining) <= 20:
+            console.print(
+                f"[yellow]Tasks left pending or blocked[/yellow]: {list(map(str, remaining))}"
+            )
+        else:
+            ref = externalize_json(
+                base_dir=paths.artifacts,
+                category="lists",
+                obj=[str(x) for x in remaining],
+                ext=".json",
+            )
+            console.print(
+                f"[yellow]Tasks left pending or blocked[/yellow]: count={len(remaining)} ref={ref.get('path')}"
+            )
 
     # Unified validation across all generated files
     any_failed = False
     out_files: List[str] = []
     for fpath, meta in file_meta_by_path.items():
-        language = meta.get("language") or infer_language_from_path(fpath) or ""
+        language = meta.get("language") or ""
         out_path = paths.outputs / fpath
         assembled = out_path.read_text(encoding="utf-8") if out_path.exists() else ""
         if not out_path.exists() or not assembled.strip():
             console.print(f"[red]Output missing or empty[/red]: {fpath}")
-            bus.emit("VALIDATION_FAILED", node_id=node_id, kind="output", message="output_missing_or_empty", file=fpath, parent_id=parent_id)
+            bus.emit(
+                "VALIDATION_FAILED",
+                node_id=node_id,
+                kind="output",
+                message="output_missing_or_empty",
+                file=fpath,
+                parent_id=parent_id,
+            )
             any_failed = True
             continue
 
@@ -1381,30 +2383,99 @@ def main(
             if not verify.get("ok", False):
                 missing = verify.get("missing", exports)
                 console.print(f"[red]Exports missing[/red] in {fpath}: {missing}")
-                bus.emit("VALIDATION_FAILED", node_id=node_id, kind="exports", message=f"missing_exports: {missing}", file=fpath, parent_id=parent_id)
+                bus.emit(
+                    "VALIDATION_FAILED",
+                    node_id=node_id,
+                    kind="exports",
+                    message=f"missing_exports: {missing}",
+                    file=fpath,
+                    parent_id=parent_id,
+                )
                 any_failed = True
                 continue
 
         # Track in project structure on success
         try:
             out_files.append(str(out_path.relative_to(paths.outputs)))
-            bus.emit("VALIDATION_PASSED", node_id=node_id, file=fpath, report=None, parent_id=parent_id)
+            bus.emit(
+                "VALIDATION_PASSED", node_id=node_id, file=fpath, report=None, parent_id=parent_id
+            )
         except Exception:
             # Non-fatal
             pass
 
     # Save progressive CodeSpec after all tasks complete
     adapter.save_codespec()
-    
+
     atomic_write_json(paths.outputs / "project_structure.json", {"files": out_files})
 
     # If any task failed or validations failed, mark node failed and exit non-zero
     any_task_failed = any(st == "failed" for st in statuses.values())
     if any_failed or any_task_failed:
         reason = "validation failed" if any_failed else "one or more tasks failed"
-        status.write(node_id, "FAILED_FINAL", prev_state="LEASED", reason=reason, parent_id=parent_id)
+        status.write(
+            node_id, "FAILED_FINAL", prev_state="LEASED", reason=reason, parent_id=parent_id
+        )
         bus.emit("NODE_FAILED", node_id=node_id, reason=reason, parent_id=parent_id)
         raise typer.Exit(code=1)
+
+    # Compute obligation coverage report (best-effort; non-fatal by default).
+    try:
+        cov = compute_obligation_coverage(
+            plan=tp.model_dump(exclude_none=True),
+            run_dir_path=str(paths.root),
+            ledger_store=ledger_store,
+        )
+        bus.emit(
+            "COVERAGE_COMPUTED",
+            node_id=node_id,
+            ok=bool(cov.get("ok", False)),
+            counts=dict(cov.get("counts") or {}),
+            parent_id=parent_id,
+        )
+    except Exception:
+        cov = None
+
+    # Deterministic closure validation (artifact wiring + obligation coverage).
+    # This is language-agnostic and does not parse code.
+    try:
+        from crpb.validation.closure import ClosureConfig, validate_run_closure
+
+        strict_env = "1"
+        try:
+            strict_env = str(os.environ.get("CRPB_CLOSURE_STRICT", "1"))
+        except Exception:
+            strict_env = "1"
+        strict = str(strict_env).strip().lower() in ("1", "true", "yes")
+
+        cfg = ClosureConfig(
+            require_artifact_registry_presence=True,
+            require_consumes_exist_in_registry=True,
+            require_produces_exist_in_registry=True,
+            require_consumers_depend_on_producers=True,
+            require_coverage_closed=True,
+        )
+        closure = validate_run_closure(tp=tp, run_dir_path=str(paths.root), config=cfg)
+        bus.emit(
+            "CLOSURE_VALIDATED",
+            node_id=node_id,
+            ok=bool(closure.get("ok", False)),
+            parent_id=parent_id,
+        )
+        if strict and not bool(closure.get("ok", False)):
+            reason = "closure_not_closed"
+            status.write(
+                node_id,
+                "FAILED_FINAL",
+                prev_state="LEASED",
+                reason=reason,
+                parent_id=parent_id,
+            )
+            bus.emit("NODE_FAILED", node_id=node_id, reason=reason, parent_id=parent_id)
+            raise typer.Exit(code=1)
+    except Exception:
+        # If closure validation itself errors, keep historical behavior (non-fatal).
+        pass
 
     status.write(node_id, "DONE", prev_state="LEASED", parent_id=parent_id)
     bus.emit("NODE_DONE", node_id=node_id, parent_id=parent_id)
@@ -1412,4 +2483,6 @@ def main(
     if out_files:
         console.print(f"[green]Tasks build complete[/green]. Outputs: {out_files}")
     else:
-        console.print("[yellow]Tasks execution complete with no assembled outputs yet (no code:function leaves).[/yellow]")
+        console.print(
+            "[yellow]Tasks execution complete with no assembled outputs yet (no code:function leaves).[/yellow]"
+        )

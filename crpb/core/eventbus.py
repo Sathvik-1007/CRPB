@@ -1,8 +1,10 @@
 from __future__ import annotations
+
+import time
 from pathlib import Path
 from typing import Any
-import time
-from .utils.fs import append_jsonl, ensure_parent
+
+from ..utils.fs import append_jsonl, ensure_parent
 
 
 class EventBus:

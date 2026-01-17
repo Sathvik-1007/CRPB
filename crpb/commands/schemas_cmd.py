@@ -1,10 +1,13 @@
 from __future__ import annotations
-from pathlib import Path
+
 import json
+from pathlib import Path
+
 import typer
 from rich.console import Console
-from ..config import resolve_run_dir, make_paths
-from ..specs import TaskSpec, TaskPlan, CodeSpecFile, CodeSpec
+
+from ..core.config import make_paths, resolve_run_dir
+from ..core.specs import CodeSpec, CodeSpecFile, TaskPlan, TaskSpec
 from ..utils.ui import sep
 
 app = typer.Typer(help="Generate JSON Schemas for core specs into outputs/schemas/")
